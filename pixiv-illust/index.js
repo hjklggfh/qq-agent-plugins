@@ -1285,8 +1285,9 @@ async function fetchImage(item, s) {
       const got = await downloadToTemp(urls[i], s.timeoutMs, s.maxImageBytes);
       // 成功时也报一行：调 imageSize 时最想知道的就是"实际下的是哪一档、多少字节"。
       // 之前成功路径完全静默，查那个 12.5MB 故障时只能从失败里反推（2026-10-08 的教训）。
+      // **必须带 pid**：不带的话多张作品混在一起就分不清哪个是哪张（又踩过一次）。
       try {
-        api?.log?.info?.(`[pixiv-illust] 取图成功：${Math.round(got.bytes / 1024)}KB`
+        api?.log?.info?.(`[pixiv-illust] 取图成功 ${item.pid}：${Math.round(got.bytes / 1024)}KB`
           + `（第 ${i + 1}/${urls.length} 个候选，档位 ${s.imageSize}）`);
       } catch { /* 日志失败不影响取图 */ }
       return got;
