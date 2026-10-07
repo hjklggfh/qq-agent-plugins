@@ -148,12 +148,14 @@ const DEFAULTS = {
   // 把群聊刷屏、也别把 60 秒的工具预算耗光（每页 1~3 秒）。
   maxPages: 4,
   // 续页的**时间预算**（毫秒）。工具的硬上限是 60 秒，而下载与最后那次发送共用它 ——
-  // 所以取图阶段先花掉 40 秒就收手，留 20 秒给发送。按"页数"限制是不够的：每页 1~3MB，
+  // 取图阶段先花掉 30 秒就收手，把剩下的一半留给发送。按"页数"限制是不够的：每页 1~5MB，
   // maxPages=10 照样能顶穿 60 秒，然后工具被掐断、**什么都没发出去**（2026-10-08 实测）。
-  pageBudgetMs: 40000,
-  // 续页的**字节预算**：门面的合并转发上限是"图片合计 12MB"，这里更早收手（10MB）。
-  // 取多了没用 —— 转发会被门面拒掉，再回落逐张发只会更慢。
-  forwardBudgetBytes: 10 * 1024 * 1024,
+  pageBudgetMs: 30000,
+  // 续页的**字节预算**。它盯的**不是**门面那个 12MB 上限，而是"一张卡片多大才发得动" ——
+  // 2026-10-08 线上实测：一张 10MB 的卡片（base64 后约 14MB）光是**发出去**就把 60 秒耗光了
+  // （走 WebSocket 通道不假，但腾讯那边收下 10MB 也要时间）。**瓶颈在发送、不在下载**，
+  // 所以这个值要按"发得动的卡片"来定，经验值约 4MB。
+  forwardBudgetBytes: 4 * 1024 * 1024,
   // 分级：多选（全年龄 / R18 / R18G），可选一个或多个、**至少一个**。
   // 只有勾上的档会发出来。旧字段 allowR18 仍保留在下面，只在配置里没有 ratings 时才读。
   ratings: ['safe'],
@@ -1681,8 +1683,18 @@ export async function activate(hostApi) {
               if (!pageUrls.length) break;
               try {
                 const more = await fetchImage({ ...it, imageUrl: '', imageUrls: pageUrls }, s, { allowTemplate: false });
+                // 加进去**之前**先算：这一页会不会把合计顶过预算。
+                // （原先是"取下一页之前判"——那样最多会多收一页，而多收的那页正是把发送
+                //  拖过 60 秒、或者把卡片顶过 12MB 门线的原因 ✗。判据必须落在"收之前"。）
+                const pageBytes = Number(more.bytes) || 0;
+                if (collectedBytes + pageBytes > forwardBudgetBytes) {
+                  say(`[pixiv-illust] ${it.pid} 再加第 ${page + 1} 页会到 `
+                    + `${Math.round((collectedBytes + pageBytes) / 1048576)}MB（预算 `
+                    + `${Math.round(forwardBudgetBytes / 1048576)}MB），就发前 ${extraPages.length + 1} 页`);
+                  break;
+                }
                 extraPages.push({ file: more.file, page });
-                collectedBytes += Number(more.bytes) || 0;
+                collectedBytes += pageBytes;
               } catch (error) {
                 const status = Number(error?.status) || 0;
                 // 404/410 = 这个作品没有这一页 → 正常结束（不记日志，那是预期的边界）
