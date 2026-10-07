@@ -135,8 +135,10 @@ systemctl --user restart qq-agent-linux.service
 每个会话可以单独设分级，**本会话覆盖 → 全局 `ratings` → 旧 `allowR18` → 全年龄**。
 覆盖存在状态目录的 `chat-ratings.json` 里（形如
 `{ "group:123": ["safe"], "private:456": ["safe","r18"] }`），由 `pixiv_set_rating` 工具维护，
-也可以直接改这个文件（改完立即生效，**不用重启** —— 它不经过 `api.config`）。
-写坏的条目只会被忽略并记一条告警，不影响别的会话。
+也可以直接改这个文件，**但改完要重启才生效** —— 插件把这份文件缓存在内存里
+（`loadChatRatings` 命中缓存就不再读盘），改盘上的文件进程内看不到。
+**想让它在不重启的情况下生效，就在那个会话里让机器人改**（走 `pixiv_set_rating` 工具，
+那条路会同步更新缓存）。写坏的条目只会被忽略并记一条告警，不影响别的会话。
 
 > 旧 manifest 的 `configSchema` 里有一条 `chatRatingsFile`（label「按会话的分级覆盖
 > （技能自己管的文件）」）。它当时也不是一个可填的设置，只是**说明这个文件**；本项目里位置
