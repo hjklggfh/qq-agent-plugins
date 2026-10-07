@@ -1236,7 +1236,10 @@ async function readBodyCapped(resp, cap, controller) {
     //    所以措辞必须说"已读…还没读完" —— 第一版写成"图片 X 超过上限 Y"，于是打出了
     //    「图片 1.3MB 超过上限 1.3MB」这种自相矛盾的句子（被用户当成 bug 报回来了）。
     const e = new Error(`图片超过上限 ${(cap / 1048576).toFixed(1)}MB`
-      + `（已读 ${(bytes / 1048576).toFixed(1)}MB 仍未读完，真实大小未知）`);
+      + `（已读 ${(bytes / 1048576).toFixed(1)}MB 仍未读完，真实大小未知）`
+      // 报错要能自己指出该改哪里：这个上限来自插件设置，**显式设置会盖掉代码默认值** ——
+      // 2026-10-08 就因为设置里留着一个旧值、而代码默认值改大了，白查了一轮。
+      + '；想发更大的图就把插件设置里的 maxImageBytes 调大');
     e.tooBig = true;
     e.bytes = bytes;
     return e;
@@ -1288,7 +1291,8 @@ async function downloadToTemp(url, timeoutMs, maxBytes) {
     const declared = Number(resp.headers.get('content-length')) || 0;
     if (declared > cap) {
       try { ac.abort(); } catch { /* 已结束 */ }
-      const e = new Error(`原图 ${(declared / 1048576).toFixed(1)}MB 超过上限 ${(cap / 1048576).toFixed(1)}MB`);
+      const e = new Error(`原图 ${(declared / 1048576).toFixed(1)}MB 超过上限 ${(cap / 1048576).toFixed(1)}MB`
+        + '；想发更大的图就把插件设置里的 maxImageBytes 调大');
       e.tooBig = true;
       e.bytes = declared;
       throw e;
