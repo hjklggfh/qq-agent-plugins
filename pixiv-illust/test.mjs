@@ -1640,13 +1640,18 @@ const NEED_FFMPEG = FFMPEG
   ? false
   : (fakeWorks ? false : '这台机器上既没有 ffmpeg、也装不上内置替身（Windows）—— 这条用例要真压缩，按惯例跳过');
 
-/** 造一张"大原图"：有真 ffmpeg 就用它（顺带把真实产物也验了），否则用替身造。 */
-async function makeBigImage(dir, name = 'big.jpg', qv = 3) {
+/**
+ * 造一张"大原图"：有真 ffmpeg 就用它（顺带把真实产物也验了），否则用替身造。
+ * `size` 是边长（正方形）。**纯噪声**最不容易压小，所以体积稳；但也正因为难压，
+ * 尺寸要按用例挑：1000 够"超过阈值"，但缩完明显小于 4MB/5 页的均摊（见卡片那条用例）。
+ */
+async function makeBigImage(dir, { name = 'big.jpg', qv = 3, size = 1600 } = {}) {
   const out = path.join(dir, name);
   if (FFMPEG) {
     const r = await runProcess(FFMPEG, [
       '-hide_banner', '-loglevel', 'error', '-y',
-      '-f', 'lavfi', '-i', `nullsrc=s=1600x1600,format=rgb24,geq=random(1)*255:random(2)*255:random(3)*255,format=yuvj420p`,
+      '-f', 'lavfi', '-i',
+      `nullsrc=s=${size}x${size},format=rgb24,geq=random(1)*255:random(2)*255:random(3)*255,format=yuvj420p`,
       '-frames:v', '1', '-q:v', String(qv), out
     ]);
     if (r.code === 0 && fs.existsSync(out)) return { file: out, bytes: fs.statSync(out).size };
@@ -1655,7 +1660,7 @@ async function makeBigImage(dir, name = 'big.jpg', qv = 3) {
   if (!fakeWorks) return null;
   const code = await runFakeFfmpeg(FAKE, [
     '-hide_banner', '-loglevel', 'error', '-y',
-    '-f', 'lavfi', '-i', 'nullsrc=s=1600x1600', '-frames:v', '1', '-q:v', String(qv), out
+    '-f', 'lavfi', '-i', `nullsrc=s=${size}x${size}`, '-frames:v', '1', '-q:v', String(qv), out
   ]);
   if (code !== 0 || !fs.existsSync(out)) return null;
   return { file: out, bytes: fs.statSync(out).size };
@@ -1828,82 +1833,125 @@ check('降采样（真压缩）：大图缩成 JPEG，最长边 1200、体积明
   assert.equal(h % 2, 0, `高必须是偶数（mjpeg 要求），实际 ${h}`);
 }, NEED_FFMPEG);
 
-check('降采样（真压缩）：4MB 卡片预算下 5 页大图能全收进、并打包成一条卡片', async () => {
+check('降采样（真压缩）：5 页大图缩完能全收进**一条卡片**、且预算按缩后的体积算', async () => {
   const dir = mkTemp('qq-pixiv-ds-card-');
-  const big = await makeBigImage(dir);
+  // 故意造小一点（1000x1000 噪声）：它是**纯噪声**，JPEG 几乎压不动，比真实插画难压得多。
+  // 用更大的图会让"缩完每页仍有 1MB+"，于是 4MB 只装得下 4 页 —— 量的就成了预算拦不拦，
+  // 而不是"缩完装得下几张"（这条用例第一次上真机就是这么红的）。
+  const big = await makeBigImage(dir, { size: 1000 });
   assert.ok(big, '造图失败');
-  assert.ok(big.bytes > 1500 * 1024,
-    `这条用例要的是"原图大到装不下几张"的现场，实际只有 ${big.bytes} 字节 —— 造图参数要调大`);
-  const pageBytes = fs.readFileSync(big.file);
-
-  internals.__setState([], []);
-  const { ctx, images, forwards } = fakeHostCtx();
-  const toolCtx = makeToolCtx(ctx);
-  internals.__setStateDir(toolCtx.dir);   // 门面 sendForward 的路径守卫只认这个目录
+  assert.ok(big.bytes > 800 * 1024,
+    `这条用例要的是"原图大到该被缩"的现场，实际只有 ${big.bytes} 字节 —— 造图参数要调大`);
 
   const pid = '123450001';
   const base = 'https://i.pixiv.re/img-master/img/2023/03/03/03/03/03';
   const PAGES = 5;
+  const pageBytes = fs.readFileSync(big.file);
+  const servePage = () => fakeImageResponse({
+    contentType: 'image/jpeg',
+    contentLength: pageBytes.length,
+    body: chunkStream([new Uint8Array(pageBytes)])
+  });
+  const searchJson = () => ({
+    ok: true,
+    status: 200,
+    headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+    async json() {
+      return {
+        data: [{
+          pid: Number(pid), p: 0, title: '多图大图', author: '作者', r18: false,
+          tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+        }]
+      };
+    }
+  });
+
+  // ── 第一遍：只把第 1 页**真的压缩一次**，量出"缩后一页多大" ──────────────
+  // 预算不写死，而是**量出来的**：这样这条用例在任何压缩率下都成立
+  // （纯噪声/真插画、替身/真 ffmpeg），量的是不变量而不是某个环境的巧合数字。
+  internals.__setStateDir(mkTemp('qq-pixiv-ds-measure-'));
+  __setSettingsForTest({ downsampleOverBytes: 512 * 1024 });
+  let pageCost = 0;
+  try {
+    const first = await withFetch(
+      async (url) => (String(url).includes('/setu/v2') ? searchJson() : servePage()),
+      () => internals.__fetchImage({ pid, imageUrl: `${base}/${pid}_p0_master1200.jpg` },
+        { ...internals.DEFAULTS, timeoutMs: 3000 })
+    );
+    assert.equal(first.downsized, true, '原图超过 512KB 阈值，这一页必须被缩过');
+    // ⚠️ 这条是**承重**的：上面那句只断言"标记为缩过"，而这个新用例的预算是由 pageCost
+    //    **推导**出来的 —— 万一 pageCost 实际是**原图**体积（例如记账被改回原图），
+    //    预算会跟着变大、自己把自己救了，整个用例反而永远绿（在本机用变异验证抓到的空档）。
+    assert.ok(first.bytes < big.bytes / 2,
+      `量到的那一页必须真的比原图小：原图 ${big.bytes} → 量到 ${first.bytes}`);
+    pageCost = first.bytes;
+  } finally {
+    __setSettingsForTest(null);
+  }
+  // 预算取"刚好装得下 5 页、第 6 页必然超"：既证明 5 页装得进，也证明记账用的是缩后的体积——
+  // 若哪次改成按**原图**记账，第 1 页自己就会超预算（原图比这个预算大得多），立刻判红。
+  const budget = pageCost * PAGES + Math.floor(pageCost / 2);
+  assert.ok(big.bytes > budget,
+    `原图（${big.bytes}）必须大于这个预算（${budget}），否则"记账用原图"这个变异就测不出来`);
+
+  // ── 第二遍：真跑一遍工具，5 页 + 探测第 6 页 ─────────────────────────────
+  internals.__setState([], []);
+  const { ctx, images, forwards } = fakeHostCtx();
+  const sink = fakeLogger();
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);   // 门面 sendForward 的路径守卫只认这个目录
   const asked = [];
   // 本机没装真 ffmpeg 时，把"spawn ffmpeg"接到替身上 —— 这样这条路走的仍然是**真的**
   // "下载 → spawn ffmpeg → 检查产物 → 按最终体积记账 → 打包"，只是压缩器换了实现。
   const restoreSpawn = HAVE_REAL_FFMPEG ? null : delegateSpawnToFake();
+  __setLogSinkForTest((level, message) => sink.lines.push(`${level}:${message}`));
+  __setSettingsForTest({ downsampleOverBytes: 512 * 1024, maxPages: 6, forwardBudgetBytes: budget });
   try {
     await withFetch(
       async (url) => {
         const u = String(url);
         asked.push(u);
-        if (u.includes('/setu/v2')) {
-          return {
-            ok: true,
-            status: 200,
-            headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
-            async json() {
-              return {
-                data: [{
-                  pid: Number(pid), p: 0, title: '多图大图', author: '作者', r18: false,
-                  tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
-                }]
-              };
-            }
-          };
-        }
-        // 5 页都给**真实的大 JPEG 字节** —— 这样这条路走的就是真的"下载 → ffmpeg 压缩 → 记账"
-        if (new RegExp(`/${pid}_p[0-${PAGES - 1}]_`).test(u)) {
-          return fakeImageResponse({
-            contentType: 'image/jpeg',
-            contentLength: pageBytes.length,
-            body: chunkStream([new Uint8Array(pageBytes)])
-          });
-        }
+        if (u.includes('/setu/v2')) return searchJson();
+        if (new RegExp(`/${pid}_p[0-${PAGES - 1}]_`).test(u)) return servePage();
         return fakeImageResponse({ status: 404 });   // 第 6 页不存在 → 续页到此为止
       },
       () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
     );
   } finally {
-    // 内存里的 PID 索引清干净（盘上那份在刚才那个临时状态目录里，不影响别的用例）
-    internals.__setState([], []);
+    __setLogSinkForTest(null);
+    __setSettingsForTest(null);
+    internals.__setState([], []);   // 内存里的 PID 索引清干净（盘上那份在临时目录里）
     if (restoreSpawn) restoreSpawn();
   }
 
   const paged = asked.filter((one) => one.includes(`_p`));
-  assert.equal(paged.length, PAGES + 1, `应该取了 5 页 + 探测第 6 页，实际请求 ${paged.length} 次`);
+  const downsized = [...sink.all().matchAll(/降采样：(\d+)KB → (\d+)KB/g)]
+    .map((m) => ({ from: Number(m[1]), to: Number(m[2]) }));
+  assert.equal(paged.length, PAGES + 1,
+    `应该取了 5 页 + 探测第 6 页，实际请求 ${paged.length} 次`);
+  // 每一页都必须真的被缩过（阈值调到 512KB，而每页都远大于它）
+  assert.equal(downsized.length, PAGES,
+    `每一页都该留下一条"降采样：XKB → YKB"，实际 ${downsized.length} 条：\n${sink.all()}`);
   assert.equal(forwards.length, 1, '5 页大图该打包成**一条**卡片');
   assert.equal(images.length, 0, '走卡片时不该再逐张发');
   const nodes = forwards[0].payload.nodes;
-  assert.equal(nodes.length, PAGES + 1, '一条说明 + 5 张图');
-  // ★ 这条就是本轮改动的目的：缩过之后，5 页大图加起来还远在 4MB 预算之内
+  assert.equal(nodes.length, PAGES + 1, '一条说明 + 5 张图 —— 预算刚好装得下 5 页');
   const total = nodes.filter((n) => n.data.content[0].type === 'image')
     .reduce((sum, n) => sum + Buffer.byteLength(n.data.content[0].data.file.replace('base64://', ''), 'base64'), 0);
-  assert.ok(total < internals.DEFAULTS.forwardBudgetBytes,
-    `5 页缩完应该在 4MB 预算之内（实际 ${total} 字节）`);
+  assert.ok(total <= budget, `5 页合计（${total}）必须在预算（${budget}）之内`);
+  // 缩过的合计要明显小于原图之和 —— 与上面"刚好装下 5 页"合起来才说明
+  // **记账用的是缩后的体积**（变异：换回原图体积 → 第 1 页就超预算、nodes 变 2，判红）
   assert.ok(total < pageBytes.length * PAGES / 2,
     `缩过的总字节要明显小于原图之和（原图 ${pageBytes.length}×${PAGES}，实际 ${total}）`);
+  // 把实测值打出来：**这个数就是"4MB 能装几页"的依据**，比任何说明都直接
+  console.log(`    [实测] 原图 ${Math.round(pageBytes.length / 1024)}KB/页 → 缩后 `
+    + `${Math.round(pageCost / 1024)}KB/页（本用例预算 ${Math.round(budget / 1024)}KB）；`
+    + `同样比例下 **4MB 卡片约能装 ${Math.floor(internals.DEFAULTS.forwardBudgetBytes / pageCost)} 页**`);
 }, NEED_FFMPEG);
 
 check('降采样（真压缩）：走逐张发那条路时，发的也是**缩小的**那个文件', async () => {
   const dir = mkTemp('qq-pixiv-ds-send-');
-  const big = await makeBigImage(dir, 'single.jpg');
+  const big = await makeBigImage(dir, { name: 'single.jpg' });
   assert.ok(big && big.bytes > 800 * 1024, '造图失败或不够大');
   internals.__setState([], []);
   internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-ds-sendstate-')));
