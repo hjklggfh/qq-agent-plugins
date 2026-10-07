@@ -146,14 +146,18 @@ const DEFAULTS = {
   timeoutMs: 15000,
   // 单张图的体积上限（字节）。超过就**不下载**，换下一个候选地址。
   //
-  // 为什么必须有这一条（2026-10-08 实测，不是理论值）：这个插件在取图时优先用后端返回的
-  // **原图**完整路径。阿里云一台实例上实测那张原图 13,080,814 字节（12.5MB），
-  // 而到 `i.pixiv.re` 的速度约 118KB/s —— 下完要 **约 108 秒**，而工具上限只有 60 秒，
-  // 于是每次都是"整 60 秒被宿主掐断"，看起来像插件坏了。
-  // 同一个作品的 PID 简写形式（`pixiv.re/{pid}.png`）是**压缩过的**，4.6 秒就拿到。
-  // 何况群里发一张图也没必要 12.5MB —— 宿主还要把它 base64（膨胀 1.37 倍）塞进 OneBot 请求体。
-  // 想要原图就把它调大（例如 20 * 1024 * 1024），代价是慢和请求体大。
-  maxImageBytes: 5 * 1024 * 1024,
+  // ⚠️ 这个值不是拍脑袋来的，是**量出来的**（2026-10-08）：
+  //   图片最终是 base64 塞进 JSON body POST 给协议端的（`src/onebot/onebot.js` 的 call()），
+  //   而协议端对请求体有 **2MB** 硬上限 —— 实测 1.5MB body 正常、2MB 起直接断连
+  //   （`fetch failed` / `UND_ERR_SOCKET`，服务端连错误响应都不回）。
+  //   base64 会把体积放大 1.37 倍，所以图片最多约 2MB ÷ 1.37 ≈ 1.46MB；
+  //   再留 10% 给 JSON 外壳，取 **1.3MiB**。
+  //
+  //   为什么必须有这条：曾经一张 3.6MB 的原图被下下来、然后发送失败，报的却是一句
+  //   `fetch failed` —— 完全没有线索。有了这条上限，它会在**下载阶段**就被拒掉，
+  //   报的是"这张图多大、上限多少"。
+  //   想要原图就调大，但要知道协议端那个 2MB 的坎不会因此消失（要改得动宿主）。
+  maxImageBytes: 1363148,
   // 取图的**尺寸档**（lolicon 接口的 size 参数）：original / regular / small / thumb / mini。
   //
   // ⚠️ 默认**不是** original，这一条是 2026-10-08 用真实故障换来的：
@@ -797,6 +801,48 @@ export function imageCandidates(item, template) {
   return list;
 }
 
+/**
+ * 从 Pixiv 图床的地址里认出日期路径、作品号、页码与扩展名。认不出返回 null。
+ *
+ * 例：`https://i.pixiv.re/img-original/img/2022/11/20/22/05/11/127664527_p0.jpg`
+ *     → { year:'2022', month:'11', day:'20', hour:'22', minute:'05', second:'11',
+ *         pid:'127664527', page:'0', ext:'jpg' }
+ */
+export function parseOriginalPath(url) {
+  const m = /\/(\d{4})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d+)_p(\d+)\.([a-z0-9]+)/i
+    .exec(String(url ?? ''));
+  if (!m) return null;
+  return {
+    year: m[1], month: m[2], day: m[3], hour: m[4], minute: m[5], second: m[6],
+    pid: m[7], page: m[8], ext: m[9].toLowerCase()
+  };
+}
+
+/**
+ * 由**原图地址**推出尺寸版地址（同一台图床、同一个日期路径）。
+ *
+ * 命名规则不是猜的：下面 regular / small / thumb 三种形状就是 `api.lolicon.app` 自己在
+ * `size=` 参数下返回过的**原样**（实测可用，且只有这种 `/img-master/` 路径不卡 ——
+ * `/img-original/` 那条路会给出十几 MB 的原图）。拿它来替代"先下原图再想办法缩小"。
+ */
+export function sizeUrlsFromOriginal(originalUrl, size = DEFAULTS.imageSize) {
+  const p = parseOriginalPath(originalUrl);
+  if (!p) return [];
+  let origin = '';
+  try { origin = new URL(String(originalUrl)).origin; } catch { return []; }
+  const date = `${p.year}/${p.month}/${p.day}/${p.hour}/${p.minute}/${p.second}`;
+  const page = `p${p.page}`;
+  const master = `/img-master/img/${date}/${p.pid}_${page}_master1200.jpg`;
+  const ladder = {
+    original: `${origin}/img-original/img/${date}/${p.pid}_${page}.${p.ext}`,
+    regular: `${origin}${master}`,
+    small: `${origin}/c/540x540_70${master}`,
+    thumb: `${origin}/c/250x250_80_a2/img-master/img/${date}/${p.pid}_${page}_square1200.jpg`
+  };
+  // mini 的形状没有实测依据，不给（sizeLadderFrom 里它就自然落空）
+  return sizeLadderFrom(size).map((key) => ladder[key]).filter(Boolean);
+}
+
 /** 把 HTTP 状态翻成人话 —— 404 和超时是完全不同的两件事，别混成一句"反代挂了"。 */
 export function describeImageHttp(status) {
   if (status === 404 || status === 410) {
@@ -1023,7 +1069,7 @@ function requestHeaders(s, accept, url, { minimal = false } = {}) {
  *    作品 pid，不接受模型给的任意 URL（模型能给的是 keyword / pid，pid 还要过
  *    extractPid 的纯数字校验）—— 见 README「关于 http 能力的如实说明」。
  */
-async function doFetch(url, accept, timeoutMs, { minimal = false, controller = null } = {}) {
+async function doFetch(url, accept, timeoutMs, { minimal = false, controller = null, method = 'GET', redirect = 'follow', quiet = false } = {}) {
   const s = settings();
   const proxyUrl = resolveProxyUrl(s);
   const dispatcher = await dispatcherFor(proxyUrl);
@@ -1035,13 +1081,17 @@ async function doFetch(url, accept, timeoutMs, { minimal = false, controller = n
   try {
     // 移植接口差异：原版是 `await api.fetch(url, {...})`（宿主门面）。
     return await fetch(url, {
+      method,
+      redirect,
       headers: requestHeaders(s, accept, url, { minimal }),
       signal: ac.signal,
       ...(dispatcher ? { dispatcher } : {})
     });
   } catch (error) {
     if (isNetError(error)) {
-      noteNetFailure();
+      // quiet：探测性请求（比如"读一下 301 的 Location 看能不能推出小图"）不该计入熔断 ——
+      // 它失败只说明这个优化没戏，主流程照旧，不该因此把整个插件停 5 分钟。
+      if (!quiet) noteNetFailure();
       const wrapped = new Error(describeFetchError(error, ms, proxyUrl, url));
       wrapped.netError = true;
       // 硬失败（DNS 解析不了 / 连接被拒）：换域名也一样连不上，取图那条路该直接放弃整张作品。
@@ -1271,6 +1321,28 @@ async function downloadToTemp(url, timeoutMs, maxBytes) {
 }
 
 /**
+ * 「直接给 pid / 链接」那条路没有图床给的尺寸地址，只有 PID 模板；而模板会 **301 到原图**
+ * （可能十几 MB，且 `/img-original/` 这条路径在这个网络上连响应头都等不到）。
+ *
+ * 但那个 301 的 `Location` 里带着**日期路径** —— 拿它就能推出几百 KB 的尺寸版，
+ * 完全不必碰原图地址。所以这里发一个 HEAD（不下载 body）读 Location 再转成候选地址。
+ *
+ * ⚠️ `redirect: 'manual'` 是**必须**的：跟随重定向就会去请求那个会卡住的原图地址。
+ *    实测 Node（undici）在 manual 下能读到 location（浏览器里读不到 —— 这里是 Node，才行）。
+ * ⚠️ `quiet: true`：这是"锦上添花"的探测，失败只说明推不出来，主流程照旧走模板；
+ *    不能因为它去累加熔断计数（否则三次取图就够把插件停 5 分钟）。
+ */
+async function sizeUrlsFromTemplate(templateUrl, s) {
+  try {
+    const resp = await doFetch(templateUrl, 'image/*,*/*;q=0.8', s.timeoutMs,
+      { method: 'HEAD', redirect: 'manual', quiet: true });
+    const location = String(resp?.headers?.get?.('location') ?? '').trim();
+    if (!location) return [];
+    return sizeUrlsFromOriginal(new URL(location, templateUrl).toString(), s.imageSize);
+  } catch { return []; }
+}
+
+/**
  * 取一张作品的图：先按尺寸档试图床给的地址（从大到小），最后才落到 PID 模板。
  *
  * 404（作品没了）**换下一个地址**试；超时/太大这类"这个地址不可用"也换下一个地址试
@@ -1278,7 +1350,22 @@ async function downloadToTemp(url, timeoutMs, maxBytes) {
  * 只有硬失败（DNS 不了 / 连接被拒）才放弃整张 —— 那时换域名也一样连不上，白等一个超时没意义。
  */
 async function fetchImage(item, s) {
-  const urls = imageCandidates(item, s.imageUrlTemplate);
+  // 「给 pid/链接」那条路只有模板一个候选（**完全没有图床给的地址**）→ 先用 301 推出尺寸版。
+  // 这一步是它唯一能拿到小图的机会：模板本身给的是原图，往往超过 maxImageBytes。
+  // ⚠️ 条件必须是"连 imageUrl 都没有"，不能只看 imageUrls 空不空：
+  //    走 pixiv.net 后端那条路也是只有 imageUrl、没有 imageUrls，而它已经有真地址了，
+  //    再探测一次纯属白费一个请求（有用例盯着这个次数）。
+  let itemUrls = Array.isArray(item?.imageUrls) ? item.imageUrls : [];
+  if (!itemUrls.length && !String(item?.imageUrl ?? '').trim() && item?.pid) {
+    const derived = await sizeUrlsFromTemplate(buildImageUrl(s.imageUrlTemplate, item.pid), s);
+    if (derived.length) {
+      itemUrls = derived;
+      try {
+        api?.log?.info?.(`[pixiv-illust] ${item.pid}：由 301 的 Location 推出 ${derived.length} 个尺寸版候选`);
+      } catch { /* 日志失败不影响取图 */ }
+    }
+  }
+  const urls = imageCandidates({ ...item, imageUrls: itemUrls }, s.imageUrlTemplate);
   let last = null;
   for (let i = 0; i < urls.length; i += 1) {
     try {

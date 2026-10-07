@@ -57,7 +57,7 @@ const {
   buildLoliconUrl, mapLoliconItems, resolveRatings, filterByRating, normalizeRatingTokens,
   pickUnseen, buildTryList, extractPid, ownerIdSet, latestCaller, callerMayChangeRating,
   ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
-  imageCandidates, sizeLadderFrom, pickSizeUrls
+  imageCandidates, sizeLadderFrom, pickSizeUrls, parseOriginalPath, sizeUrlsFromOriginal
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
@@ -456,8 +456,7 @@ check('尺寸档映射：所选档优先、更小的档留着当备选（大图�
   assert.deepEqual(dup.imageUrls, ['https://a/x.jpg']);
 });
 
-check('imageCandidates：各尺寸档依次试，最后才落到 PID 模板', () => {
-  const item = {
+check('imageCandidates：各尺寸档依次试，最后才落到 PID 模板', () => {  const item = {
     pid: '138387319',
     imageUrl: 'https://i.pximg.net/c/1200x1200/r.jpg',
     imageUrls: ['https://i.pximg.net/c/1200x1200/r.jpg', 'https://i.pximg.net/c/540x540/s.jpg']
@@ -913,4 +912,120 @@ check('装载器全流程：带审批 initPlugins → loaded，注入的工具�
   // 同一个自建根里的另一个插件（my-first-plugin）也在，未启用就是 disabled
   assert.equal(result.statuses.find((item) => item.id === 'my-first-plugin').status, 'disabled');
   await resetPlugins();
+});
+
+// ── 5MB→1.3MiB 那个上限、以及"给 pid 时推出尺寸版"（2026-10-08 第二轮）────────
+//
+// 现场：一张 3.6MB 的图**下载成功**却在发送时报 `fetch failed`，日志里没有任何线索。
+// 查下来是协议端对 HTTP 请求体有 **2MB** 硬上限（实测 1.5MB 正常、2MB 起直接断连，
+// 报 UND_ERR_SOCKET），而图片是 base64 进 JSON body 的（膨胀 1.37 倍）。
+
+check('maxImageBytes 默认值：由协议端 2MB 请求体上限 ÷ base64 膨胀算出来', () => {
+  assert.equal(internals.DEFAULTS.maxImageBytes, 1363148);
+  // 这条断言就是那个换算：base64 之后**必须**还在 2MB 以内，否则必然被协议端掐断
+  assert.ok(internals.DEFAULTS.maxImageBytes * 1.37 < 2 * 1024 * 1024,
+    '1.37 倍膨胀后必须低于 2MB');
+  // 默认尺寸档远低于它，所以正常情况下根本不会碰到这条上限
+  assert.ok(internals.DEFAULTS.maxImageBytes > 1024 * 1024, '别小到把正常的 regular 也拦掉');
+});
+
+check('parseOriginalPath / sizeUrlsFromOriginal：拼出来的与接口给过的形状逐字节相同', () => {
+  const orig = 'https://i.pixiv.re/img-original/img/2022/11/20/22/05/11/102960701_p0.jpg';
+  assert.deepEqual(parseOriginalPath(orig), {
+    year: '2022', month: '11', day: '20', hour: '22', minute: '05', second: '11',
+    pid: '102960701', page: '0', ext: 'jpg'
+  });
+  // 下面这三个 URL 是 api.lolicon.app 在 size=regular/small/thumb 下**原样返回过**的
+  // （从这台服务器上抓下来的），所以这是一条"与外部事实对齐"的断言，不是自说自话。
+  assert.deepEqual(sizeUrlsFromOriginal(orig, 'regular'), [
+    'https://i.pixiv.re/img-master/img/2022/11/20/22/05/11/102960701_p0_master1200.jpg',
+    'https://i.pixiv.re/c/540x540_70/img-master/img/2022/11/20/22/05/11/102960701_p0_master1200.jpg',
+    'https://i.pixiv.re/c/250x250_80_a2/img-master/img/2022/11/20/22/05/11/102960701_p0_square1200.jpg'
+  ]);
+  assert.equal(sizeUrlsFromOriginal(orig, 'small')[0],
+    'https://i.pixiv.re/c/540x540_70/img-master/img/2022/11/20/22/05/11/102960701_p0_master1200.jpg');
+  assert.equal(sizeUrlsFromOriginal(orig, 'original')[0], orig, 'original 档给的就是 301 的目标本身');
+
+  // 多图作品的页码要跟着走（第 2 页不能被换成第 0 页）
+  const p2 = 'https://i.pximg.net/img-original/img/2023/01/02/03/04/05/123_p2.png';
+  assert.match(sizeUrlsFromOriginal(p2, 'regular')[0], /123_p2_master1200\.jpg$/);
+  // 认不出就返回空 —— 不猜、不乱拼地址
+  assert.deepEqual(sizeUrlsFromOriginal('https://x/y.png'), []);
+  assert.equal(parseOriginalPath('https://x/y.png'), null);
+  assert.deepEqual(sizeUrlsFromOriginal(''), []);
+  assert.deepEqual(sizeUrlsFromOriginal(null), []);
+});
+
+check('给 pid 那条路：用 301 的 Location 推出尺寸版，绝不请求原图地址', async () => {
+  internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-301-')));
+  const orig = 'https://i.pixiv.re/img-original/img/2022/11/20/22/05/11/102960701_p0.jpg';
+  const calls = [];
+  const got = await withFetch(
+    async (url, options) => {
+      calls.push({ url: String(url), method: options?.method, redirect: options?.redirect });
+      if (options?.method === 'HEAD') {
+        // 模拟 pixiv.re/{pid}.png 的 301：manual 模式下 location 可读（实测 Node 可以）
+        return {
+          ok: false,
+          status: 301,
+          headers: { get: (n) => (String(n).toLowerCase() === 'location' ? orig : null) },
+          body: null
+        };
+      }
+      if (String(url).includes('/img-master/')) {
+        return fakeImageResponse({ contentLength: 4, body: chunkStream([new Uint8Array([7, 7, 7, 7])]) });
+      }
+      throw new Error(`不该请求这个地址：${url}`);
+    },
+    () => internals.__fetchImage({ pid: '102960701' }, { ...internals.DEFAULTS, timeoutMs: 3000 })
+  );
+
+  assert.equal(calls[0].method, 'HEAD', '第一步是 HEAD（不下载 body）');
+  assert.equal(calls[0].redirect, 'manual', '必须 manual：跟随重定向就会去请求卡住的原图地址');
+  assert.ok(calls[0].url.endsWith('pixiv.re/102960701.png'), `第一步该探测模板地址，实际 ${calls[0].url}`);
+  assert.ok(calls[1].url.includes('/img-master/'), `第二步该是尺寸版，实际 ${calls[1].url}`);
+  assert.ok(!calls.some((one) => one.url.includes('/img-original/')),
+    '绝不该请求原图地址 —— 那是十几 MB，也正是这次故障的来源');
+  assert.equal(got.bytes, 4);
+});
+
+check('给 pid 那条路：推不出来（没有 Location）时照旧退回模板，不报错', async () => {
+  internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-noloc-')));
+  const calls = [];
+  const got = await withFetch(
+    async (url, options) => {
+      calls.push(String(url));
+      if (options?.method === 'HEAD') return { ok: true, status: 200, headers: { get: () => null }, body: null };
+      return fakeImageResponse({ contentLength: 3, body: chunkStream([new Uint8Array([1, 2, 3])]) });
+    },
+    () => internals.__fetchImage({ pid: '4242' }, { ...internals.DEFAULTS, timeoutMs: 3000 })
+  );
+  assert.equal(got.bytes, 3, '没有 Location 时模板仍然要能用');
+  assert.ok(calls.some((one) => one.endsWith('pixiv.re/4242.png')), '回到模板地址');
+});
+
+check('给 pid 那条路：探测失败不计入熔断（否则三次取图就把插件停 5 分钟）', async () => {
+  internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-quiet-')));
+  internals.__resetBreaker();
+  try {
+    // ⚠️ 这里必须让**所有**请求都失败才能验出来：如果只是 HEAD 失败、后面的模板取图成功，
+    //    成功会把计数清零（noteNetSuccess），于是"有没有 quiet"结果都一样 —— 用例就成了空跑
+    //    （第一版就是这么写的，是靠变异测试才发现的）。
+    await withFetch(
+      async () => {
+        const e = new Error('fetch failed');
+        e.cause = { code: 'ECONNRESET' };
+        throw e;
+      },
+      async () => {
+        try {
+          await internals.__fetchImage({ pid: '1' }, { ...internals.DEFAULTS, timeoutMs: 3000 });
+        } catch { /* 全失败是这条用例的预期 */ }
+      }
+    );
+    // HEAD 探测 + 模板取图各失败一次。只有后者该计数 → 1；HEAD 也计就是 2。
+    assert.equal(breakerState().streak, 1, '只该记模板那一次失败，探测性 HEAD 不算');
+  } finally {
+    internals.__resetBreaker();
+  }
 });
