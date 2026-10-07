@@ -1,0 +1,5 @@
+# 这个仓库要 clone 到 Linux 服务器上跑，所以把换行钉死成 LF。
+# 不加这一条的话，取决于各台机器的 core.autocrlf：Windows 上检出会变成 CRLF，
+# 而带 \r 的 .sh / .js 到 Linux 上轻则报错、重则难查（`bash x.sh` 会在奇怪的地方失败）。
+* text=auto eol=lf
+*.sh text eol=lf
