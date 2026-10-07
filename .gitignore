@@ -16,3 +16,6 @@ Desktop.ini
 .DS_Store
 *.log
 *.tmp
+
+# 服务器上的只读 PAT（sync-plugins.sh 会读它）。绝不入库。
+.github-token

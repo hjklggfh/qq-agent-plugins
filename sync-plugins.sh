@@ -47,15 +47,25 @@ curl_gh() {
 echo "==> ① 先试 git 通道"
 # 强制 HTTP/1.1：这台机器的实测失败模式之一就是 "Error in the HTTP2 framing layer"。
 # 主程序更新器里的「强制 Git HTTP/1.1」开关治的是同一件事。
-GIT_ARGS=()
-[ "${GIT_HTTP11:-1}" = "0" ] || GIT_ARGS=(-c http.version=HTTP/1.1)
-if [ -d "$DIR/.git" ] && git "${GIT_ARGS[@]}" -C "$DIR" pull --ff-only 2>/dev/null; then
+GIT_PULL_OK=0
+if [ -d "$DIR/.git" ]; then
+  if [ "${GIT_HTTP11:-1}" = "0" ]; then
+    git -C "$DIR" pull --ff-only 2>/dev/null && GIT_PULL_OK=1
+  else
+    git -c http.version=HTTP/1.1 -C "$DIR" pull --ff-only 2>/dev/null && GIT_PULL_OK=1
+  fi
+fi
+if [ "$GIT_PULL_OK" = 1 ]; then
   echo "    git 通道可用"
 else
   echo "    git 通道不通（或这不是 git 仓库），改用 GitHub API + codeload 源码包"
+  # ⚠️ 提取 sha 必须用 `grep -o | head -1`，**不能**用 sed 的 `s/.*"sha".*/\1/`：
+  #    sed 的 `.*` 是贪婪的，单行 JSON 里 `"sha"` 出现两次（顶层 + 嵌套的 commit.tree.sha），
+  #    它会取到**最后**那个 tree sha，于是去拉一个不存在的 tarball —— 实测踩过。
+  #    grep -o 是"从左往右找不重叠的第一个"，配 head -1 才是我们要的顶层 sha。
   sha="$(curl_gh -H 'Accept: application/vnd.github+json' \
     "$API/repos/$OWNER/$REPO/commits/$BRANCH" \
-    | sed -n 's/.*"sha" *: *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+    | grep -o '"sha" *: *"[0-9a-f]\{40\}"' | head -1 | cut -d'"' -f4)"
   if [ -z "$sha" ]; then
     echo "    拿不到 commit sha —— 私有仓库要填 token（.github-token 或 QQ_AGENT_GITHUB_TOKEN）" >&2
     echo "    也可以先用 curl 看一眼 API 通不通：$API/repos/$OWNER/$REPO" >&2
@@ -86,7 +96,8 @@ for d in "$DIR"/*/; do
   [ -f "${d}plugin.json" ] || continue
   found=1
   id="$(basename "$d")"
-  version="$(sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' "${d}plugin.json" | head -1)"
+  # 同样用 grep -o 而不是贪婪的 sed（理由见上面那段注释）
+  version="$(grep -o '"version" *: *"[^"]*"' "${d}plugin.json" | head -1 | cut -d'"' -f4)"
   printf '    %-24s %s\n' "$id" "$version"
 done
 [ "$found" = 1 ] || echo "    （一个都没有）"
