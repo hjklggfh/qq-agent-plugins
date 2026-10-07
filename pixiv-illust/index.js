@@ -154,6 +154,15 @@ const DEFAULTS = {
   // 何况群里发一张图也没必要 12.5MB —— 宿主还要把它 base64（膨胀 1.37 倍）塞进 OneBot 请求体。
   // 想要原图就把它调大（例如 20 * 1024 * 1024），代价是慢和请求体大。
   maxImageBytes: 5 * 1024 * 1024,
+  // 取图的**尺寸档**（lolicon 接口的 size 参数）：original / regular / small / thumb / mini。
+  //
+  // ⚠️ 默认**不是** original，这一条是 2026-10-08 用真实故障换来的：
+  //   接口默认只给 original，而那可能是 **12.5MB** 的原图。部署这台机器（阿里云国内实例）
+  //   到 Cloudflare 的链路**搬不动这么大的文件** —— 小请求（搜索接口）1 秒就回，但 12.5MB
+  //   传到一半被重置，报 `fetch failed`，于是每次要图都失败、还连累熔断器跳闸。
+  //   同一个作品换个尺寸档：regular ≈ 几百 KB、**small 只有 39KB**、thumb 19KB、mini 4KB。
+  //   所以默认 regular（画质与体积的平衡），取图时会自动往更小的档回退（见 imageCandidates）。
+  imageSize: 'regular',
   // 一个关键词要多准备几张备选：作品被删/被限制访问时（实测 404）就自动换下一张。
   retryCandidates: 3,
   // 取不到图的作品拉黑多久（天）。搜索接口的索引是旧的，不拉黑就会永远挑到同一张死图。
@@ -316,7 +325,23 @@ export function parseSearchJson(raw) {
  *
  * @param mode 'tag' 精确标签（角色名走这个）| 'keyword' 模糊（标题/作者，标签搜不到时兜底）
  */
-export function buildLoliconUrl(apiUrl, keyword, { limit = 10, allowR18 = false, excludeAI = false, mode = 'tag', allowed = null } = {}) {
+/**
+ * lolicon 接口的尺寸档，**从大到小**。
+ *
+ * 比所选档更小的档会自动成为备选：这条"从大到小"的链子在"大图搬不动"的网络上救过场 ——
+ * 实测 12.5MB 的 original 传到一半被链路重置，而同一个作品的 small（39KB）秒过。
+ */
+export const LOLICON_SIZE_LADDER = ['original', 'regular', 'small', 'thumb', 'mini'];
+
+/** 所选尺寸档，以及比它更小的那些档（越小的越容易传完）。给接口的 size 参数用。 */
+export function sizeLadderFrom(size) {
+  const want = String(size ?? '').trim().toLowerCase();
+  const at = LOLICON_SIZE_LADDER.indexOf(want);
+  // 认不出来（拼错/留空）就按 regular 起算 —— 别悄悄退回 original 那种十几 MB 的档
+  return LOLICON_SIZE_LADDER.slice(at === -1 ? 1 : at);
+}
+
+export function buildLoliconUrl(apiUrl, keyword, { limit = 10, allowR18 = false, excludeAI = false, mode = 'tag', allowed = null, size = DEFAULTS.imageSize } = {}) {
   const base = String(apiUrl || '').trim() || DEFAULTS.loliconApiUrl;
   const kw = String(keyword ?? '').trim();
   let u;
@@ -324,6 +349,10 @@ export function buildLoliconUrl(apiUrl, keyword, { limit = 10, allowR18 = false,
   if (mode === 'keyword') u.searchParams.set('keyword', kw);
   else u.searchParams.set('tag', kw);
   u.searchParams.set('num', String(clamp(limit, 1, 20)));
+  // 尺寸：**先删掉地址里可能带的 size**（插件设置是唯一真相），再按档位从小往大写进去。
+  // 不写这一句的话接口只回 original —— 就是那个 12.5MB 的来源。
+  u.searchParams.delete('size');
+  for (const one of sizeLadderFrom(size)) u.searchParams.append('size', one);
   // lolicon 口径：r18 = 0 全年龄 / 1 仅 R18 / 2 混合。
   // 它**分不出 R18 与 R18G**（只有一个布尔 r18），所以只要选了任一成人档就取"混合"，
   // 再在本机按 ratingOf（xRestrict + 标签）精筛到具体档位。
@@ -336,12 +365,31 @@ export function buildLoliconUrl(apiUrl, keyword, { limit = 10, allowR18 = false,
   return u.toString();
 }
 
+/**
+ * 从接口返回的 `urls` 里排出可用地址：**所选档优先，再往更小的档退**。
+ *
+ * 一个都没命中时（例如接口只回了 original）就退回它给的那些 —— 宁可拿到大图让
+ * maxImageBytes 去拦，也别让条目变成"没有图"。
+ */
+export function pickSizeUrls(urls, size = DEFAULTS.imageSize) {
+  const map = urls && typeof urls === 'object' ? urls : {};
+  const picked = [];
+  const push = (raw) => {
+    const u = String(raw ?? '').trim();
+    if (u && !picked.includes(u)) picked.push(u);
+  };
+  for (const key of sizeLadderFrom(size)) push(map[key]);
+  if (!picked.length) for (const key of LOLICON_SIZE_LADDER) push(map[key]);
+  return picked;
+}
+
 /** 把内置接口的返回映射成内部条目形状（之后 PID 索引/R18 过滤/挑选/文案都复用同一条路）。 */
-export function mapLoliconItems(raw) {
+export function mapLoliconItems(raw, { size = DEFAULTS.imageSize } = {}) {
   const list = Array.isArray(raw?.data) ? raw.data : [];
   return list.map((it) => {
     const pid = String(it?.pid ?? '').trim();
     if (!/^\d+$/.test(pid)) return null;
+    const picked = pickSizeUrls(it?.urls, size);
     return {
       pid,
       title: String(it?.title ?? '').trim() || '（无题）',
@@ -350,10 +398,12 @@ export function mapLoliconItems(raw) {
       bookmarks: NaN,                        // 这个接口不给收藏数
       xRestrict: it?.r18 === true ? 1 : 0,   // 统一交给 isR18 判定，避免两套 R18 口径
       tags: Array.isArray(it?.tags) ? it.tags.map((t) => String(t)) : [],
-      thumbnail: String(it?.urls?.original ?? '').trim(),
-      // 后端自带的原图地址（带日期路径 + 页码）。比"按 PID 拼模板"更准：
-      // 模板只能取到第 0 页，多图作品的第 2、3 页就丢了。
-      imageUrl: String(it?.urls?.original ?? '').trim()
+      thumbnail: picked[0] || '',
+      // 图床给的地址，**按尺寸从大到小**排好了。取图时会依次试：
+      // 大图传不完（这台机器的实测情况）就自动换更小的档，最后才落到 PID 模板。
+      // 为什么不用"后端给的原图地址"当唯一答案：那个可能是 12.5MB，这条链路搬不动。
+      imageUrl: picked[0] || '',
+      imageUrls: picked
     };
   }).filter(Boolean);
 }
@@ -726,14 +776,25 @@ export function buildImageUrl(template, pid) {
 /**
  * 一张作品可用的图片地址（按优先级）。
  *
- * 两条路都要留着，因为它们的失效方式不一样：
- *   · 后端给的原图地址：带日期路径 + 页码，最准（多图作品的第 2、3 页只有它能取到）；
+ * 三条路，失效方式各不相同：
+ *   · 图床按尺寸给的地址（可能多个档，从大到小）：画质最好，但**大的可能传不完** ——
+ *     实测这台机器到 Cloudflare 的链路搬不动 12.5MB 的原图（传到一半被重置），而同一作品的
+ *     small（39KB）秒过。所以这里把更小的档也留着，失败就换下一个。
+ *   · 后端给的地址本身（imageUrl）：尺寸映射的兜底。
  *   · PID 简写模板：不依赖后端返回，但只能取第 0 页，而且**不是所有作品都认**
- *     （实测 https://pixiv.re/{pid}.png 对某些 pid 返回 404，而对另一些正常返回图片）。
+ *     （实测 https://pixiv.re/{pid}.png 对某些 pid 返回 404，而对另一些正常返回图片；
+ *      注意它会 301 到原图，所以拿到的还是大图，只有前面几条都不行时才轮到它）。
  */
 export function imageCandidates(item, template) {
-  const list = [String(item?.imageUrl || '').trim(), buildImageUrl(template, item?.pid)];
-  return [...new Set(list.filter(Boolean))];
+  const list = [];
+  const push = (raw) => {
+    const u = String(raw ?? '').trim();
+    if (u && !list.includes(u)) list.push(u);
+  };
+  for (const one of (Array.isArray(item?.imageUrls) ? item.imageUrls : [])) push(one);
+  push(item?.imageUrl);
+  push(buildImageUrl(template, item?.pid));
+  return list;
 }
 
 /** 把 HTTP 状态翻成人话 —— 404 和超时是完全不同的两件事，别混成一句"反代挂了"。 */
@@ -1036,9 +1097,9 @@ async function searchIllusts(s, keyword, want, allowed = null) {
     // 先按标签（角色名走这个），标签搜不到再退化到标题/作者模糊搜索
     for (const mode of ['tag', 'keyword']) {
       const url = buildLoliconUrl(s.loliconApiUrl, keyword, {
-        limit, allowed: allowedSet, excludeAI: s.excludeAI === true, mode
+        limit, allowed: allowedSet, excludeAI: s.excludeAI === true, mode, size: s.imageSize
       });
-      const items = mapLoliconItems(await requestJson(url));
+      const items = mapLoliconItems(await requestJson(url), { size: s.imageSize });
       if (items.length) return { items, backend: `builtin/${mode}` };
     }
     return { items: [], backend: 'builtin' };

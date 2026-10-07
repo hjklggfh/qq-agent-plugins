@@ -112,7 +112,7 @@ systemctl --user restart qq-agent-linux.service
 | `excludeAI` | boolean | `false` | 排除 AI 生成的作品 | 默认关。开启后内置接口会过滤掉标记为 AI 生成的插画。 |
 | `proxyUrl` | string | `''` | 代理地址（可选） | http(s) 代理，如 `http://127.0.0.1:7890`。**默认的 builtin 搜索不需要它**；只有走 pixiv.net 那条路时才需要。Clash / v2ray 等一般都开了 HTTP(混合) 端口 —— 注意本插件底层是 undici 的 `ProxyAgent`，**不支持 `socks5://`**（填了会在日志里报代理不可用并退回直连）。留空会回退读 `HTTPS_PROXY` / `ALL_PROXY` 环境变量。 |
 | `searchUrlTemplate` | string | 见 `DEFAULTS` | pixiv.net 搜索地址模板（高级） | 只在使用 pixiv.net 后端时生效。占位符：`{kw}` 关键词(已 URL 编码)、`{page}` 页码。 |
-| `imageUrlTemplate` | string | `https://pixiv.re/{pid}.png` | 图片地址模板 | `{pid}` 替换成作品号。默认 `https://pixiv.re/{pid}.png` —— 这个简写形式**实测可用**。⚠️ 别改成 `i.pixiv.re/{pid}.jpg`：那个域名只认带日期的完整路径，光给 PID 会 404（踩过）。 |
+| `imageUrlTemplate` | string | `https://pixiv.re/{pid}.png` | 图片地址模板（**最后兜底**） | `{pid}` 替换成作品号。默认 `https://pixiv.re/{pid}.png` 能用，但 **2026-10-08 实测它 301 重定向到原图** —— 所以它拿到的是十几 MB 的大图，只有前面那些尺寸地址（`imageSize` 那条路）全失败时才轮到它，而且通常会被 `maxImageBytes` 拦掉。⚠️ 别改成 `i.pixiv.re/{pid}.jpg`：那个域名只认带日期的完整路径，光给 PID 会 404（踩过）。 |
 | `cookie` | string | `''` | Pixiv Cookie（可选） | 填 `PHPSESSID=xxxx` 可拿到更完整的结果（含收藏数）与成人向内容。留空也能用，只是结果较少。 |
 | `userAgent` | string | `''` | User-Agent（可选） | 留空用内置的常见浏览器 UA。Pixiv 对空 UA 会 403。 |
 | `poolSize` | number | `5` | 候选池大小 | 按收藏数排序后，从前 N 个里随机挑一个发。默认 5 —— 既不发永远同一张，也不至于发冷门图。 |
@@ -125,7 +125,8 @@ systemctl --user restart qq-agent-linux.service
 | `retryCandidates` | number | `3` | 额外备选张数 | 默认 3。除了要发的张数，再多准备几张备选：抽到的作品如果已经被作者删了／限制访问（取图 404），就自动换成备选里的下一张，不会让整个请求失败。 |
 | `deadTtlDays` | number | `7` | 取不到的作品拉黑天数 | 默认 7 天。取图 404 的作品会被拉黑，避免同一个关键词每次都挑到同一张死图；到期自动放行（作品可能只是临时受限）。网络类失败（超时）不会被拉黑。 |
 | `timeoutMs` | number | `15000` | 单次请求超时（毫秒） | 国内走代理时可能需要调大。⚠️ 旧 manifest 里这条的 description 写「默认 20000」，而两边的实际默认值都是 **15000**（代码里的 `DEFAULTS.timeoutMs` 与旧 manifest 的 `settings.timeoutMs` 一致），以 15000 为准。**这个时限覆盖到"读完响应体"**，不只是等响应头（2026-10-08 修的，见第 7 节最后三行）。 |
-| `maxImageBytes` | number | `5242880`（5MB） | 单张图片体积上限 | 超过就**不下载**，直接换下一个候选地址。2026-10-08 加的，起因是一个真实故障：后端给的原图 **12.5MB**，而某台服务器到图床只有约 **118KB/s**（下完要 ~108 秒，而工具上限是 60 秒），于是每次都是"整 60 秒被掐断"；同一个作品的 PID 简写形式是压缩过的、4.6 秒就拿到。想要原图就调大（例如 `20971520`），代价是慢、而且宿主要把它 base64 后塞进 OneBot 请求体（膨胀 1.37 倍）。 |
+| `imageSize` | enum：`original`/`regular`/`small`/`thumb`/`mini` | `regular` | 取图的尺寸档 | **默认不是 `original`，这是 2026-10-08 用真实故障换来的**：接口默认只给 original，而那可能是 **12.5MB**；某些网络（实测阿里云一台国内实例）到 Cloudflare 的链路**搬不动这么大的文件** —— 小请求（搜索接口）1 秒就回，12.5MB 传到一半被重置，报 `fetch failed`。同一个作品换档后：`regular` ≈ 几百 KB、**`small` 只有 39KB**、`thumb` 19KB、`mini` 4KB。取图时会**自动往更小的档回退**（`regular` 传不完就试 `small`、再 `thumb`），所以除非你的网络很好，不建议改成 `original`。 |
+| `maxImageBytes` | number | `5242880`（5MB） | 单张图片体积上限 | 超过就**不下载**，直接换下一个候选地址（有 `Content-Length` 就先看大小、一个字节都不下；没有就边读边算、越界即中止）。配合 `imageSize` 用：默认档远低于它，只有落到 `original` 时才会被拦。 |
 
 ### 按会话的分级覆盖
 
@@ -232,6 +233,8 @@ manifest 里声明了 `http`，但**本插件实际没有走宿主的 fetch 门�
 | 走 pixiv.net 后端一直超时 | 没配 `proxyUrl`。Node 的 fetch 不读环境变量代理时会被冷却 10 分钟。 |
 | 「只有主人能改」 | 说话人的 QQ 不在 `ownerIds` 里（本宿主没有第二个判定来源）。 |
 | 日志里「候选地址不可用（原图 12.5MB 超过上限 5.0MB），改试 PID 简写形式」 | **这是正常的回退，不是错误**：后端给的原图太大，插件按 `maxImageBytes` 拒掉它、改用压缩过的简写形式。想让它去下原图就调大 `maxImageBytes`（代价见设置表）。 |
+| 异常面板报 `图都没发出去 —— <pid>：fetch failed`（**不是**超时、不是 404） | 传输**中途被重置**：图太大而这条链路搬不完。先确认 `imageSize` 是不是被改成了 `original`（默认 `regular` 不会撞上）；还是不行就再往小调一档（`small` 只有 39KB）。**这不是"网络不通"** —— 搜索接口能返回就说明网是通的。 |
+| 异常面板报「最近 3 次请求都没连上，已暂停取图」 | 熔断器跳闸（连续 3 次连接级失败，停 5 分钟）。注意它只在"这次请求彻底失败"时累加，成功一次就清零；`404` 和"体积超限"都**不计入**。所以反复跳闸通常意味着图一直传不完 —— 按上一条调 `imageSize`。 |
 | 每次取图都"整 60 秒超时" | 图床的原图在你这条线路上太大/太慢（实测 12.5MB / 118KB/s ≈ 108 秒，而工具上限 60 秒）。先看日志有没有上面那条回退记录；没有的话说明**第一候选卡在响应体上**，把 `timeoutMs` 调小（例如 `6000`）能让它更快失败、更快退到简写形式。 |
 | 日志里「本会话…有分级覆盖 / 分级过滤」之后没有下文 | 搜索通了，卡在取图。按上面两条排查。 |
 

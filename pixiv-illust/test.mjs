@@ -56,7 +56,8 @@ const {
   activate, available, internals,
   buildLoliconUrl, mapLoliconItems, resolveRatings, filterByRating, normalizeRatingTokens,
   pickUnseen, buildTryList, extractPid, ownerIdSet, latestCaller, callerMayChangeRating,
-  ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState
+  ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
+  imageCandidates, sizeLadderFrom, pickSizeUrls
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
@@ -361,6 +362,24 @@ check('buildLoliconUrl：关键词编码、num/r18/excludeAI 参数、tag 与 ke
   assert.equal(new URL(buildLoliconUrl('https://api.lolicon.app/setu/v2', 'x', { limit: 999 })).searchParams.get('num'), '20');
   // 地址不合法要报出来，而不是拿空串去请求
   assert.throws(() => buildLoliconUrl('not a url', 'x'), /内置搜索接口地址不合法/);
+
+  // ── 尺寸档（2026-10-08 加：接口默认只给 original，而那可能是 12.5MB，部分网络传不完）──
+  const sizes = (u) => new URL(u).searchParams.getAll('size');
+  assert.deepEqual(sizes(buildLoliconUrl('https://api.lolicon.app/setu/v2', 'x', { size: 'original' })),
+    ['original', 'regular', 'small', 'thumb', 'mini'], '选了 original 就把它和更小的档都写上');
+  assert.deepEqual(sizes(buildLoliconUrl('https://api.lolicon.app/setu/v2', 'x', { size: 'regular' })),
+    ['regular', 'small', 'thumb', 'mini'], 'regular 起算：不带 original（那正是要避开的大家伙）');
+  assert.deepEqual(sizes(buildLoliconUrl('https://api.lolicon.app/setu/v2', 'x')),
+    ['regular', 'small', 'thumb', 'mini'], '默认就是 regular');
+  assert.deepEqual(sizes(buildLoliconUrl('https://api.lolicon.app/setu/v2', 'x', { size: '没这个档' })),
+    ['regular', 'small', 'thumb', 'mini'], '认不出来的档位按 regular 起算，别悄悄退回 original');
+  // 地址里原本带的 size 要被设置覆盖掉（插件设置是唯一真相），否则会多出一份 original
+  assert.deepEqual(sizes(buildLoliconUrl('https://api.lolicon.app/setu/v2?size=original', 'x', { size: 'small' })),
+    ['small', 'thumb', 'mini']);
+  // 原有参数不能被 size 挤掉
+  const withProxy = new URL(buildLoliconUrl('https://api.lolicon.app/setu/v2?proxy=pixiv.re', 'x'));
+  assert.equal(withProxy.searchParams.get('proxy'), 'pixiv.re');
+  assert.equal(withProxy.searchParams.getAll('size').length, 4);
 });
 
 check('mapLoliconItems：字段映射与缺字段兜底', () => {
@@ -384,7 +403,9 @@ check('mapLoliconItems：字段映射与缺字段兜底', () => {
     xRestrict: 1,                            // r18:true → 1，统一交给 isR18/ratingOf
     tags: ['初音ミク', 'R-18'],
     thumbnail: 'https://i.pixiv.re/img-original/img/2024/01/02/03/04/05/12345678_p0.jpg',
-    imageUrl: 'https://i.pixiv.re/img-original/img/2024/01/02/03/04/05/12345678_p0.jpg'
+    imageUrl: 'https://i.pixiv.re/img-original/img/2024/01/02/03/04/05/12345678_p0.jpg',
+    // 只给了 original（旧接口/旧地址的行为）→ 退回它给的那些，别让条目变成"没有图"
+    imageUrls: ['https://i.pixiv.re/img-original/img/2024/01/02/03/04/05/12345678_p0.jpg']
   });
   assert.equal(items[1].pid, '87654321');
   assert.equal(items[1].title, '（无题）');
@@ -393,6 +414,67 @@ check('mapLoliconItems：字段映射与缺字段兜底', () => {
   assert.deepEqual(items[1].tags, []);
   assert.deepEqual(mapLoliconItems(null), []);
   assert.deepEqual(mapLoliconItems({ data: 'nope' }), []);
+});
+
+check('sizeLadderFrom：档位从大到小，认不出按 regular 起算（别悄悄退回十几 MB 的 original）', () => {
+  assert.deepEqual(sizeLadderFrom('original'), ['original', 'regular', 'small', 'thumb', 'mini']);
+  assert.deepEqual(sizeLadderFrom('regular'), ['regular', 'small', 'thumb', 'mini']);
+  assert.deepEqual(sizeLadderFrom('mini'), ['mini']);
+  assert.deepEqual(sizeLadderFrom(''), ['regular', 'small', 'thumb', 'mini']);
+  assert.deepEqual(sizeLadderFrom(undefined), ['regular', 'small', 'thumb', 'mini']);
+  assert.deepEqual(sizeLadderFrom('ORIGINAL'), ['original', 'regular', 'small', 'thumb', 'mini'], '大小写不敏感');
+  assert.deepEqual(sizeLadderFrom('巨大'), ['regular', 'small', 'thumb', 'mini'], '认不出就当 regular');
+});
+
+check('尺寸档映射：所选档优先、更小的档留着当备选（大图传不完就退档）', () => {
+  const u = {
+    original: 'https://i.pximg.net/img-original/img/x_p0.png',
+    regular: 'https://i.pximg.net/c/1200x1200/img-master/x_p0_master1200.jpg',
+    small: 'https://i.pximg.net/c/540x540_70/img-master/x_p0_master1200.jpg',
+    thumb: 'https://i.pximg.net/c/250x250_80_a2/img-master/x_p0_square1200.jpg'
+  };
+  const raw = { data: [{ pid: 138387319, r18: false, urls: u }] };
+
+  const [item] = mapLoliconItems(raw, { size: 'regular' });
+  assert.deepEqual(item.imageUrls, [u.regular, u.small, u.thumb],
+    '从 regular 起按从大到小排；**不含 original**（那正是要避开的十几 MB 大图）');
+  assert.equal(item.imageUrl, u.regular, '首选就是所选档');
+  assert.equal(item.thumbnail, u.regular);
+
+  const [big] = mapLoliconItems(raw, { size: 'original' });
+  assert.deepEqual(big.imageUrls, [u.original, u.regular, u.small, u.thumb],
+    '选了 original 就把它排最前，但更小的档仍要留着当备选');
+
+  // 某个档缺失就跳过它，不能因此空手而归
+  const [hole] = mapLoliconItems({ data: [{ pid: 1, urls: { original: 'https://a/o.png', small: 'https://a/s.jpg' } }] },
+    { size: 'regular' });
+  assert.deepEqual(hole.imageUrls, ['https://a/s.jpg'], 'regular 缺失 → 退到 small');
+
+  // 两个档给同一个地址要去重
+  const [dup] = mapLoliconItems({ data: [{ pid: 1, urls: { regular: 'https://a/x.jpg', small: 'https://a/x.jpg' } }] },
+    { size: 'regular' });
+  assert.deepEqual(dup.imageUrls, ['https://a/x.jpg']);
+});
+
+check('imageCandidates：各尺寸档依次试，最后才落到 PID 模板', () => {
+  const item = {
+    pid: '138387319',
+    imageUrl: 'https://i.pximg.net/c/1200x1200/r.jpg',
+    imageUrls: ['https://i.pximg.net/c/1200x1200/r.jpg', 'https://i.pximg.net/c/540x540/s.jpg']
+  };
+  const list = imageCandidates(item, 'https://pixiv.re/{pid}.png');
+  assert.deepEqual(list, [
+    'https://i.pximg.net/c/1200x1200/r.jpg',
+    'https://i.pximg.net/c/540x540/s.jpg',
+    'https://pixiv.re/138387319.png'
+  ], '先按尺寸从大到小，再是条目自带的地址，最后才是 PID 模板');
+  assert.equal(list.filter((one) => one === item.imageUrl).length, 1, 'imageUrl 已在 imageUrls 里就不重复');
+
+  // 老形状（只有 imageUrl、没有 imageUrls）照样能用
+  assert.deepEqual(imageCandidates({ pid: '1', imageUrl: 'https://a/x.png' }, 'https://b/{pid}.png'),
+    ['https://a/x.png', 'https://b/1.png']);
+  // 什么都没有时，模板是最后的兜底
+  assert.deepEqual(imageCandidates({ pid: '1' }, 'https://b/{pid}.png'), ['https://b/1.png']);
 });
 
 check('resolveRatings / filterByRating：只勾 R18G 时就只出 R18G；空选择被兜成 safe', () => {
