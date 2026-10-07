@@ -1235,7 +1235,11 @@ function sweepTemp(maxAgeMs = 15 * 60 * 1000) {
  */
 async function readBodyCapped(resp, cap, controller) {
   const tooBig = (bytes) => {
-    const e = new Error(`图片 ${(bytes / 1048576).toFixed(1)}MB 超过上限 ${(cap / 1048576).toFixed(1)}MB`);
+    // ⚠️ 这里只知道**已读**了多少字节，不知道图片真实多大（chunked 响应没有 Content-Length）。
+    //    所以措辞必须说"已读…还没读完" —— 第一版写成"图片 X 超过上限 Y"，于是打出了
+    //    「图片 1.3MB 超过上限 1.3MB」这种自相矛盾的句子（被用户当成 bug 报回来了）。
+    const e = new Error(`图片超过上限 ${(cap / 1048576).toFixed(1)}MB`
+      + `（已读 ${(bytes / 1048576).toFixed(1)}MB 仍未读完，真实大小未知）`);
     e.tooBig = true;
     e.bytes = bytes;
     return e;
@@ -1332,14 +1336,34 @@ async function downloadToTemp(url, timeoutMs, maxBytes) {
  * ⚠️ `quiet: true`：这是"锦上添花"的探测，失败只说明推不出来，主流程照旧走模板；
  *    不能因为它去累加熔断计数（否则三次取图就够把插件停 5 分钟）。
  */
-async function sizeUrlsFromTemplate(templateUrl, s) {
+async function sizeUrlsFromTemplate(templateUrl, s, pid = '') {
+  let status = 0;
   try {
+    // ⚠️ 用 **GET** 而不是 HEAD：有些反代/CDN 对 HEAD 直接 405，或者 HEAD 就不回 Location。
+    //    （第一版用的是 HEAD，结果探测一直静默失败，于是拿不到尺寸版、白白落到十几 MB 的原图。）
+    //    `redirect: 'manual'` 保证**绝不**跟到那个原图：我们只要 301 的头和它那几十字节的 body。
     const resp = await doFetch(templateUrl, 'image/*,*/*;q=0.8', s.timeoutMs,
-      { method: 'HEAD', redirect: 'manual', quiet: true });
+      { method: 'GET', redirect: 'manual', quiet: true });
+    status = Number(resp?.status) || 0;
     const location = String(resp?.headers?.get?.('location') ?? '').trim();
-    if (!location) return [];
-    return sizeUrlsFromOriginal(new URL(location, templateUrl).toString(), s.imageSize);
-  } catch { return []; }
+    try { await resp?.body?.cancel?.(); } catch { /* 不读了，随手把连接放掉 */ }
+    if (!location) {
+      // 探测失败要**说出来**：上一版这里是静默 return []，于是"为什么没拿到小图"白查了两轮。
+      say(`[pixiv-illust] ${pid}：模板没有重定向（HTTP ${status}），只能按原图取`);
+      return [];
+    }
+    const urls = sizeUrlsFromOriginal(new URL(location, templateUrl).toString(), s.imageSize);
+    if (!urls.length) say(`[pixiv-illust] ${pid}：301 的目标认不出日期路径（${location.slice(0, 90)}），只能按原图取`);
+    return urls;
+  } catch (error) {
+    say(`[pixiv-illust] ${pid}：读 301 失败（${String(error?.message ?? error).slice(0, 60)}），只能按原图取`);
+    return [];
+  }
+}
+
+/** 记一行 info 日志；日志本身失败绝不能影响取图，所以统一吞掉异常。 */
+function say(message) {
+  try { api?.log?.info?.(message); } catch { /* 日志失败不影响主流程 */ }
 }
 
 /**
@@ -1357,7 +1381,7 @@ async function fetchImage(item, s) {
   //    再探测一次纯属白费一个请求（有用例盯着这个次数）。
   let itemUrls = Array.isArray(item?.imageUrls) ? item.imageUrls : [];
   if (!itemUrls.length && !String(item?.imageUrl ?? '').trim() && item?.pid) {
-    const derived = await sizeUrlsFromTemplate(buildImageUrl(s.imageUrlTemplate, item.pid), s);
+    const derived = await sizeUrlsFromTemplate(buildImageUrl(s.imageUrlTemplate, item.pid), s, item.pid);
     if (derived.length) {
       itemUrls = derived;
       try {

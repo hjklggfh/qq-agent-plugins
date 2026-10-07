@@ -963,7 +963,8 @@ check('给 pid 那条路：用 301 的 Location 推出尺寸版，绝不请求�
   const got = await withFetch(
     async (url, options) => {
       calls.push({ url: String(url), method: options?.method, redirect: options?.redirect });
-      if (options?.method === 'HEAD') {
+      // 探测与真下载都是 GET，靠 redirect 区分：探测必须是 manual（不跟随重定向）
+      if (options?.redirect === 'manual') {
         // 模拟 pixiv.re/{pid}.png 的 301：manual 模式下 location 可读（实测 Node 可以）
         return {
           ok: false,
@@ -980,7 +981,7 @@ check('给 pid 那条路：用 301 的 Location 推出尺寸版，绝不请求�
     () => internals.__fetchImage({ pid: '102960701' }, { ...internals.DEFAULTS, timeoutMs: 3000 })
   );
 
-  assert.equal(calls[0].method, 'HEAD', '第一步是 HEAD（不下载 body）');
+  assert.equal(calls[0].method, 'GET', '第一步用 GET（HEAD 会被一些反代 405 掉、也不回 Location）');
   assert.equal(calls[0].redirect, 'manual', '必须 manual：跟随重定向就会去请求卡住的原图地址');
   assert.ok(calls[0].url.endsWith('pixiv.re/102960701.png'), `第一步该探测模板地址，实际 ${calls[0].url}`);
   assert.ok(calls[1].url.includes('/img-master/'), `第二步该是尺寸版，实际 ${calls[1].url}`);
@@ -995,7 +996,7 @@ check('给 pid 那条路：推不出来（没有 Location）时照旧退回模�
   const got = await withFetch(
     async (url, options) => {
       calls.push(String(url));
-      if (options?.method === 'HEAD') return { ok: true, status: 200, headers: { get: () => null }, body: null };
+      if (options?.redirect === 'manual') return { ok: true, status: 200, headers: { get: () => null }, body: null };
       return fakeImageResponse({ contentLength: 3, body: chunkStream([new Uint8Array([1, 2, 3])]) });
     },
     () => internals.__fetchImage({ pid: '4242' }, { ...internals.DEFAULTS, timeoutMs: 3000 })
