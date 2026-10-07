@@ -57,7 +57,7 @@ const {
   buildLoliconUrl, mapLoliconItems, resolveRatings, filterByRating, normalizeRatingTokens,
   pickUnseen, buildTryList, extractPid, ownerIdSet, latestCaller, callerMayChangeRating,
   ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
-  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal, pageUrlsOf
+  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal, pageUrlsOf, parseSuffixPath
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
@@ -952,9 +952,33 @@ check('pageUrlsOf：从任意一页推出别的页（含 master1200 形状与尺
     'https://i.pixiv.re/c/540x540_70/img-master/img/2021/11/13/12/46/15/94101307_p1_master1200.jpg',
     'https://i.pixiv.re/c/250x250_80_a2/img-master/img/2021/11/13/12/46/15/94101307_p1_square1200.jpg'
   ]);
-  // 认不出日期路径（比如只有 PID 模板）→ 空数组，调用方据此放弃续页
+  // 认不出日期路径、也不是后缀形式（pid 位数不对）→ 空数组，调用方据此放弃续页
   assert.deepEqual(pageUrlsOf({ pid: '1', imageUrl: 'https://pixiv.re/1.png' }, 1), []);
   assert.deepEqual(pageUrlsOf({}, 1), []);
+});
+
+check('pageUrlsOf：pixiv.re 的页码后缀形式 —— **第 2 张是 -2，不是 -1**', () => {
+  // 实测依据（2026-10-08 在用户服务器上量的，别凭直觉改）：
+  //   pixiv.re/150374854.png    → 301 → /150374854-1.png
+  //   -1.png / -2.png / -3.png  → 200，各约 1.4MB，**三个 md5 都不同**
+  // ⇒ 无后缀那个形式拿到的**就是 -1**；所以 -1 是第 1 张（已经发过的那张），第 2 张是 -2。
+  // 这条差点写错：光看"-1 是 200、-2 也是 200"很容易以为 -1 是第 2 张。
+  const item = { pid: '150374854', imageUrl: 'https://pixiv.re/150374854.png' };
+  assert.equal(pageUrlsOf(item, 1)[0], 'https://pixiv.re/150374854-2.png',
+    '第 2 张必须是 -2：写成 -1 就会把第 1 张重发一遍');
+  assert.equal(pageUrlsOf(item, 2)[0], 'https://pixiv.re/150374854-3.png');
+  assert.equal(pageUrlsOf(item, 9)[0], 'https://pixiv.re/150374854-10.png');
+  // page=0（= 第 1 张本身）绝不能返回 —— 那是"重复发第一张"的入口
+  assert.deepEqual(pageUrlsOf(item, 0), []);
+  assert.deepEqual(pageUrlsOf(item, -1), []);
+
+  // 后缀形式只在"路径就是 /{pid}[-n].ext"时成立：带日期目录的完整地址走另一条分支
+  assert.equal(parseSuffixPath('https://i.pixiv.re/img-master/img/2021/11/13/12/46/15/94101307_p0_master1200.jpg'), null);
+  assert.deepEqual(parseSuffixPath('https://pixiv.re/150374854-3.png'),
+    { origin: 'https://pixiv.re', pid: '150374854', page: 3, ext: 'png' });
+  assert.deepEqual(parseSuffixPath('https://pixiv.re/150374854.png'),
+    { origin: 'https://pixiv.re', pid: '150374854', page: 1, ext: 'png' });
+  assert.equal(parseSuffixPath('不是地址'), null);
 });
 
 check('imageCandidates：取第 2 页起必须关掉 PID 模板（否则会重复发第 1 页）', () => {
@@ -1019,6 +1043,48 @@ check('多图作品：有合并转发能力时打包成**一条**聊天记录（
     `第 3 页已经 404，不该再去试第 4 页。实际请求过：${asked.filter((one) => one.includes('_p')).join(', ')}`);
   assert.ok(!asked.some((one) => one.includes('pixiv.re/94101307.png')),
     '绝不该请求 PID 模板（那会重复发第 1 页）');
+});
+
+check('给 pid 那条路：用 `-2`/`-3` 续页并打包成一条卡片，且**绝不碰 -1**', async () => {
+  internals.__setState([], []);
+  const pid = '150374854';
+  const asked = [];
+  const { ctx, images, forwards } = fakeHostCtx();
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);
+
+  await withFetch(
+    async (url, options) => {
+      const u = String(url);
+      asked.push({ url: u, redirect: options?.redirect });
+      // 第一步是那次"读 301"的探测：这里故意不给 location（就是线上那次 HTTP 200 的现场）
+      if (options?.redirect === 'manual') {
+        return { ok: true, status: 200, headers: { get: () => null }, body: null };
+      }
+      if (u === `https://pixiv.re/${pid}.png`) {
+        return fakeImageResponse({ contentLength: 1000, body: chunkStream([new Uint8Array(1000)]) });
+      }
+      if (u.endsWith(`/${pid}-2.png`)) {
+        return fakeImageResponse({ contentLength: 2000, body: chunkStream([new Uint8Array(2000)]) });
+      }
+      if (u.endsWith(`/${pid}-3.png`)) return fakeImageResponse({ status: 404 });   // 只有两页
+      throw new Error(`不该请求这个地址：${u}`);
+    },
+    () => registered.get('pixiv_image').execute(toolCtx, { pid })
+  );
+
+  const got = asked.filter((one) => one.redirect !== 'manual').map((one) => one.url);
+  assert.deepEqual(got, [
+    `https://pixiv.re/${pid}.png`,     // 第 1 张
+    `https://pixiv.re/${pid}-2.png`,   // 第 2 张
+    `https://pixiv.re/${pid}-3.png`    // 探测到 404 就停
+  ], `续页地址必须从 -2 起、并在 404 处停，实际：${got.join(' , ')}`);
+  // ★ 这条是本次改动的核心哨兵：`-1` 就是第 1 张，请求它 = 重复发图
+  assert.ok(!asked.some((one) => one.url.endsWith(`/${pid}-1.png`)),
+    '绝不该请求 -1.png —— 那是第 1 张（无后缀形式拿到的就是它）');
+  assert.equal(forwards.length, 1, '两页 → 打包成一条「聊天记录」');
+  assert.equal(images.length, 0);
+  assert.equal(forwards[0].payload.nodes.length, 3, '说明 + 两张图');
 });
 
 check('单图作品：就算有转发能力也**不要**套一层卡片（一张图不值得）', async () => {

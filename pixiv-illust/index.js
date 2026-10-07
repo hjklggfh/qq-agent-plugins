@@ -856,14 +856,44 @@ export function sizeUrlsFromOriginal(originalUrl, size = DEFAULTS.imageSize) {
 }
 
 /**
- * 同一个作品**第 page 页**的候选地址（按尺寸档从大到小）。认不出日期路径就返回空数组。
+ * 认出 pixiv.re 的**页码后缀形式**：`/{pid}.png` 或 `/{pid}-{n}.{ext}`。
  *
- * 多图作品的每一页地址只差 `_p<页码>`（`<pid>_p0.jpg` / `<pid>_p1.jpg` …），而日期路径
- * 在**任意一页**的地址里都有 —— 所以拿到第 0 页的地址，就能拼出后面每一页。
- * 接口（api.lolicon.app）给了 `p`（这一页的页号）但**不给总页数**，所以张数靠调用方逐页试。
+ * ⚠️ 这里的页码语义是**量出来的**（2026-10-08，用户服务器上实测）：
+ *     `pixiv.re/{pid}.png`  → **301** → `/{pid}-1.png`
+ *     `-1.png` / `-2.png` / `-3.png` → 200，各约 1.4MB，**三个 md5 都不同**（真页码）
+ *   所以：**`-1` 就是第 1 张**（无后缀那个形式最终拿到的就是它），
+ *   **第 2 张是 `-2.png`**。续页探测必须从 `-2` 起 —— 从 `-1` 起会把第 1 张重发一遍。
+ *   这条曾经差点写错：光看"`-1` 是 200、`-2` 也是 200"很容易以为 `-1` 是第 2 张。
+ */
+export function parseSuffixPath(url) {
+  let u = null;
+  try { u = new URL(String(url ?? '')); } catch { return null; }
+  // 只认"路径就是 /{pid}[-n].ext"这一种（带日期目录的完整地址走 parseOriginalPath）
+  const m = /^\/(\d{5,12})(?:-(\d+))?\.([a-z0-9]+)$/i.exec(u.pathname);
+  if (!m) return null;
+  return { origin: u.origin, pid: m[1], page: m[2] ? Number(m[2]) : 1, ext: m[3].toLowerCase() };
+}
+
+/**
+ * 同一个作品**第 page 页**的候选地址（按尺寸档从大到小）。认不出地址形式就返回空数组。
+ *
+ * 两条路，因为两个后端给的地址形状不同：
+ *   · **带日期路径**（api.lolicon.app 给的）：每一页只差 `_p<页码>`，日期路径在任意一页里都有
+ *     —— 所以拿到第 0 页就能拼出后面每一页，而且还能顺带推尺寸档。
+ *   · **页码后缀**（`pixiv.re/{pid}.png` 这条"给 pid/链接"的路）：每页只差 `-<页码>`，
+ *     见 parseSuffixPath 的注释（`-1` 就是第 1 张 ⇒ 第 2 张是 `-2`）。没有日期路径，
+ *     所以推不出尺寸档 —— 只有一条候选，但大 body 现在会走 WebSocket 通道，无所谓。
+ * 接口给了 `p`（这一页的页号）但**不给总页数**，所以张数靠调用方逐页试到取不到为止。
  */
 export function pageUrlsOf(item, page, size = DEFAULTS.imageSize) {
   const base = String(item?.imageUrl || (Array.isArray(item?.imageUrls) ? item.imageUrls[0] : '') || '').trim();
+  const suffix = parseSuffixPath(base);
+  if (suffix) {
+    const want = (Number(page) || 0) + 1;      // 调用方 page=1 表示"要第 2 张"
+    // 第 1 张就是 base 本身 —— 续页绝不能把它再要一遍（那就是"重复发第一张"）
+    if (want <= 1) return [];
+    return [`${suffix.origin}/${suffix.pid}-${want}.${suffix.ext}`];
+  }
   const p = parseOriginalPath(base);
   if (!p) return [];
   let origin = '';
