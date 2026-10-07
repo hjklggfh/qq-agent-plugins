@@ -57,7 +57,7 @@ const {
   buildLoliconUrl, mapLoliconItems, resolveRatings, filterByRating, normalizeRatingTokens,
   pickUnseen, buildTryList, extractPid, ownerIdSet, latestCaller, callerMayChangeRating,
   ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
-  imageCandidates, sizeLadderFrom, pickSizeUrls, parseOriginalPath, sizeUrlsFromOriginal
+  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
