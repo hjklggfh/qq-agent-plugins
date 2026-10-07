@@ -14,6 +14,7 @@
 //   服务器：QQ_AGENT_HOME=/mnt/data/qq-agent/app    node --test /mnt/data/qq-agent/plugins/pixiv-illust/test.mjs
 // 不指就按"与源码 checkout 平级"猜一次；猜不到**整体跳过**，而不是误报一片红。
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,8 +33,15 @@ const SKIP = hostReady
   : `找不到宿主代码（试过 ${HOST}）—— 用 QQ_AGENT_HOME 指到安装目录或源码 checkout`;
 const hostUrl = (relative) => pathToFileURL(path.join(HOST, relative)).href;
 
-/** 找得到宿主才跑；找不到就整体跳过（下面每一条都走这个包装）。 */
-const check = (name, fn) => test(name, { skip: SKIP }, fn);
+/**
+ * 找得到宿主才跑；找不到就整体跳过（下面每一条都走这个包装）。
+ *
+ * ⚠️ `ownSkip` 是**给单条用例用的**（例如"这台机器没有 ffmpeg"那几条）。原来这里只传
+ * `{ skip: SKIP }`，于是 `check(name, { skip: xxx }, fn)` 的第三个参数会被当成 fn ——
+ * 用例**静默地什么都不验就报绿**（本机实测抓到：三条"真压缩"用例全绿，而机器上根本没有
+ * ffmpeg）。所以这里必须把每条的 skip 合并进来，并在两处都成立时才跳过。
+ */
+const check = (name, fn, ownSkip = false) => test(name, { skip: SKIP || ownSkip }, fn);
 const PLUGIN_DIR = HERE;
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-plugin-'));
@@ -57,7 +65,9 @@ const {
   buildLoliconUrl, mapLoliconItems, resolveRatings, filterByRating, normalizeRatingTokens,
   pickUnseen, buildTryList, extractPid, ownerIdSet, latestCaller, callerMayChangeRating,
   ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
-  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal, pageUrlsOf, parseSuffixPath
+  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal, pageUrlsOf, parseSuffixPath,
+  // 降采样：这几个是**导出**的（不是只挂在 internals 上），因为用例要直接驱动它们
+  resolveFfmpeg, buildDownsampleArgs, downsampleToJpeg, __resetFfmpegProbe, __setSpawnForTest
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
@@ -1284,6 +1294,7 @@ check('给 pid 那条路：用 301 的 Location 推出尺寸版，绝不请求�
   assert.ok(!calls.some((one) => one.url.includes('/img-original/')),
     '绝不该请求原图地址 —— 那是十几 MB，也正是这次故障的来源');
   assert.equal(got.bytes, 4);
+  assert.equal(got.downsized, false, '4 字节的假图远在阈值之内，不该被降采样（否则这条用例量的就不是取图了）');
 });
 
 check('给 pid 那条路：推不出来（没有 Location）时照旧退回模板，不报错', async () => {
@@ -1298,6 +1309,7 @@ check('给 pid 那条路：推不出来（没有 Location）时照旧退回模�
     () => internals.__fetchImage({ pid: '4242' }, { ...internals.DEFAULTS, timeoutMs: 3000 })
   );
   assert.equal(got.bytes, 3, '没有 Location 时模板仍然要能用');
+  assert.equal(got.downsized, false, '3 字节的假图不该被降采样');
   assert.ok(calls.some((one) => one.endsWith('pixiv.re/4242.png')), '回到模板地址');
 });
 
@@ -1326,3 +1338,468 @@ check('给 pid 那条路：探测失败不计入熔断（否则三次取图就�
     internals.__resetBreaker();
   }
 });
+
+// ── ④ 降采样（2026-10-08 第四轮：让 4MB 的卡片装得下 10+ 页）──────────────────
+//
+// 需求：每页下完后，超过 ~800KB 就缩成"最长边 1200px 的 JPEG"（~300KB）再发，
+// 让 4MB 的卡片预算从"3 页"变成"10+ 页"。
+//
+// 用例分工（仓库惯例"缺件跳过"）：
+//   · **纯逻辑**（阈值、滤镜、回落分支）不依赖 ffmpeg，**永远跑**；
+//   · **真压缩**那三条要有 ffmpeg 才跑，没有就 skip（`node --test` 会记成 skipped）；
+//   · **回落**单独一条：用假的 spawn 造"ffmpeg 起不来"，**在任何机器上都能跑**
+//     （这条正是"绝不因为压缩失败而丢图"的哨兵，不能只挂在"这台机器装了 ffmpeg"上）。
+
+/** 等一个子进程结束（探测/生图/量尺寸用；这个插件自己的调用链不依赖它）。 */
+function runProcess(bin, args, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    let child = null;
+    try {
+      child = spawn(bin, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch (error) {
+      resolve({ code: -1, error: String(error?.message ?? error) });
+      return;
+    }
+    let stdout = '';
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+      resolve({ code: -1, error: 'timeout', stdout });
+    }, timeoutMs);
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({ code: -1, error: String(error?.message ?? error), stdout });
+    });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout });
+    });
+  });
+}
+
+/** true = 文件头是 JPEG 的 SOI 标记。 */
+const isJpeg = (file) => {
+  const head = Buffer.alloc(2);
+  const fd = fs.openSync(file, 'r');
+  try { fs.readSync(fd, head, 0, 2, 0); } finally { fs.closeSync(fd); }
+  return head[0] === 0xff && head[1] === 0xd8;
+};
+
+/**
+ * 一个**真的能执行**的 ffmpeg 替身（POSIX：一个 sh 脚本，chmod +x 即可）。
+ *
+ * 为什么需要它：开发机（Windows）**没有** ffmpeg，那三条"真压缩"用例会整体 skip，
+ * 而"降采样接线接对没有"就永远没在这台机器上验过。替身让它们在**没有 ffmpeg 的机器**上
+ * 也能跑起来（线上 Linux 有真 ffmpeg 时根本轮不到它）。
+ *
+ * 它**不**参与探测：探测只认真的 `ffmpeg` 命令（见"按退出码判"那条用例），替身只在
+ * `downsampleToJpeg(..., { ffmpegPath })` 这个显式出口、以及测试里显式接的 spawn 委托上被驱动。
+ * 行为严格照真 ffmpeg：`-version` 退出 0；造图退出 0；输入不存在 → **退出 1**
+ * （真 ffmpeg 在那种情形下也是"悄悄地失败"）。
+ *
+ * ⚠️ Windows 上**不做**替身，也做不了（三条路都试过，别再来一遍）：
+ *   · `spawn('ffmpeg.cmd')` → EINVAL（Node 对 .cmd 必须走 shell）；
+ *   · 拷贝 node.exe + `-e <脚本>` → ESM 加载器会把 `-e`/`--` 从 argv 里拿掉；
+ *   · 拷贝 node.exe + `NODE_OPTIONS=--require` → **node 先校验自己的命令行参数**才轮到
+ *     preload，ffmpeg 风格的 `-version` 会当场 "bad option" 退出 9。
+ *   所以 Windows 上就照仓库惯例"缺件跳过"，那三条用例会明确标成 SKIP（不是悄悄变绿）。
+ */
+function makeFakeFfmpeg() {
+  if (process.platform === 'win32') return null;
+  const dir = mkTemp('qq-pixiv-fakeffmpeg-');
+  const bin = path.join(dir, 'ffmpeg');
+  const body = [
+    "const fs = require('node:fs');",
+    "const args = process.argv.slice(2);",
+    "const val = (f) => { const i = args.indexOf(f); return i === -1 ? '' : args[i + 1]; };",
+    "if (args.includes('-version')) { console.log('ffmpeg version fake'); process.exit(0); }",
+    "const out = args[args.length - 1] || '';",
+    "const input = val('-i');",
+    "if (!input || !fs.existsSync(input)) { console.error('fake ffmpeg: no such input: ' + input); process.exit(1); }",
+    "if (args.includes('lavfi')) {",                    // 造"大原图"：qv 越小越大
+    "  const qv = Number(val('-q:v')) || 3;",
+    "  const size = Math.round(1200 * 1024 * ((32 - qv) / 30));",
+    "  const head = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);",
+    "  fs.writeFileSync(out, Buffer.concat([head, Buffer.alloc(Math.max(64, size - head.length), 7)]));",
+    "  process.exit(0);",
+    "}",
+    "const inBytes = fs.statSync(input).size;",          // 降采样：写一个 1/5 大的假 JPEG
+    "const size = Math.max(2048, Math.round(inBytes / 5));",
+    "const head = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);",
+    "fs.writeFileSync(out, Buffer.concat([head, Buffer.alloc(size - head.length, 9)]));",
+    "process.exit(0);"
+  ].join('\n');
+  try {
+    fs.writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" -e ${JSON.stringify(body)} "$@"\n`, { mode: 0o755 });
+    fs.chmodSync(bin, 0o755);
+  } catch { return null; }
+  return { bin };
+}
+
+/** 让替身跑一段（模拟"代码里 spawn 一次 ffmpeg"）。 */
+function runFakeFfmpeg(fake, ffArgs) {
+  return runChild(fake.bin, ffArgs, process.env);
+}
+
+/** 起一个子进程、只关心它怎么退出（不给管道：本沙箱里给管道会 EPERM）。 */
+function runChild(bin, args, env) {
+  return new Promise((resolve) => {
+    let child = null;
+    try {
+      child = spawn(bin, args, { stdio: 'ignore', windowsHide: true, env });
+    } catch { resolve(-1); return; }
+    child.on('error', () => resolve(-1));
+    child.on('exit', (code) => resolve(code));
+  });
+}
+
+/**
+ * 假子进程：**启动就失败**（`error` + 非 0 退出），模拟 ffmpeg 不存在 / 没权限 / 被拦掉。
+ * `error` 与 `exit` 都发，是因为两条路径的判据不同 —— 探测按**退出码**，调用按 `error`/`close`。
+ *
+ * ⚠️ `exit` 之后必须再发 `close`：真实的 ChildProcess 两个都发，而 `runFfmpegToFile` 等的是
+ *    **`close`**（它要确认 stderr 也读完了）。只发 `exit` 的话那条路径会一路等到 10 秒超时，
+ *    于是"没产出文件"这条用例拿到的是"ffmpeg 超时"——本机实测踩到。
+ */
+function rejectingSpawn() {
+  return () => ({
+    stderr: { on() {} },
+    kill() {},
+    on(event, fn) {
+      // 下一个 tick 再回调：真实 spawn 的事件也是异步的
+      if (event === 'error') setImmediate(() => fn(new Error('spawn ffmpeg ENOENT')));
+      if (event === 'exit') setImmediate(() => fn(127));
+      if (event === 'close') setImmediate(() => fn(-2));
+      return this;
+    }
+  });
+}
+
+/** 假子进程：**退出码 0 但什么都不写**（真 ffmpeg 也会这样"悄悄地失败"）。 */
+function silentSuccessSpawn() {
+  return () => ({
+    stderr: { on() {} },
+    kill() {},
+    on(event, fn) {
+      if (event === 'exit') setImmediate(() => fn(0));
+      if (event === 'close') setImmediate(() => fn(0));
+      return this;
+    }
+  });
+}
+
+const FAKE = hostReady ? makeFakeFfmpeg() : null;
+/** 替身真的能跑起来吗（起不来就照旧 skip 那三条用例，不假装验过）。 */
+let fakeWorks = false;
+if (FAKE) fakeWorks = (await runFakeFfmpeg(FAKE, ['-version'])) === 0;
+
+/**
+ * 真的探测一次 ffmpeg（**必须清缓存**：上面那条"探测按退出码判"的用例把假 spawn 的结果
+ * 写进了进程级缓存，不清的话会拿到假的 'ffmpeg'，后面的"真压缩"就**静默地什么都不验**
+ * —— 第一版正是如此：三条用例全绿而机器上根本没有 ffmpeg）。
+ */
+async function probeRealFfmpeg() {
+  __resetFfmpegProbe();
+  __setSpawnForTest(null);
+  return resolveFfmpeg();
+}
+
+const FFMPEG = hostReady ? await probeRealFfmpeg() : '';
+/** 这台机器上"有真的 ffmpeg"吗 —— 有则用它，没有则用替身，两者都没有才 skip。 */
+const HAVE_REAL_FFMPEG = Boolean(FFMPEG);
+const NEED_FFMPEG = FFMPEG
+  ? false
+  : (fakeWorks ? false : '这台机器上既没有 ffmpeg、也装不上内置替身（Windows）—— 这条用例要真压缩，按惯例跳过');
+
+/** 造一张"大原图"：有真 ffmpeg 就用它（顺带把真实产物也验了），否则用替身造。 */
+async function makeBigImage(dir, name = 'big.jpg', qv = 3) {
+  const out = path.join(dir, name);
+  if (FFMPEG) {
+    const r = await runProcess(FFMPEG, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `nullsrc=s=1600x1600,format=rgb24,geq=random(1)*255:random(2)*255:random(3)*255,format=yuvj420p`,
+      '-frames:v', '1', '-q:v', String(qv), out
+    ]);
+    if (r.code === 0 && fs.existsSync(out)) return { file: out, bytes: fs.statSync(out).size };
+    return null;
+  }
+  if (!fakeWorks) return null;
+  const code = await runFakeFfmpeg(FAKE, [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'nullsrc=s=1600x1600', '-frames:v', '1', '-q:v', String(qv), out
+  ]);
+  if (code !== 0 || !fs.existsSync(out)) return null;
+  return { file: out, bytes: fs.statSync(out).size };
+}
+
+/** 调 downsampleToJpeg：有真 ffmpeg 就不传路径（验生产路径），没有就显式给替身。 */
+const downsample = (file, options = {}) => {
+  if (FFMPEG) return downsampleToJpeg(file, options);
+  // 没有真 ffmpeg 又没有替身（Windows）时不该走到这里 —— 上面的 skip 已经拦住了；
+  // 万一漏了，就退成"没有 ffmpeg"那条路径，而不是 TypeError。
+  if (!FAKE) return downsampleToJpeg(file, { ...options, ffmpegPath: '/definitely/not/ffmpeg' });
+  return downsampleToJpeg(file, { ...options, ffmpegPath: FAKE.bin });
+};
+
+/**
+ * 把插件内部的 spawn 接到替身上（仅当这台机器没有真 ffmpeg 时用）。
+ * 返回一个"恢复原状"的函数 —— 用例的 finally 必须调它，否则后面的用例会继续看到替身。
+ */
+function delegateSpawnToFake() {
+  const delegate = (bin, args, options) => spawn(FAKE.bin, args || [], options);  __setSpawnForTest(delegate);
+  __resetFfmpegProbe();
+  return () => {
+    __setSpawnForTest(null);
+    __resetFfmpegProbe();
+  };
+}
+
+check('降采样：探测按**退出码**判"有没有 ffmpeg"（本机实测抓到的那个坑）', async () => {
+  // 现场：`stdio: 'ignore'` 下 spawn 一个**不存在**的可执行文件不会发 `error` 事件，
+  // 只以非 0（127）退出。第一版按"没收到 error = 可用"写，于是**没装 ffmpeg 的机器
+  // 也被判成装了** —— 表现是"降采样看起来生效、其实一张都没缩"，比报错难查得多。
+  const stub = (code) => () => ({
+    stderr: { on() {} },
+    kill() {},
+    on(event, fn) {
+      if (event === 'exit') setImmediate(() => fn(code));
+      return this;
+    }
+  });
+  __setSpawnForTest(stub(127));          // 不存在：只有 exit 127，没有 error
+  __resetFfmpegProbe();
+  try {
+    assert.equal(await resolveFfmpeg(), '', '退出码非 0 必须判成"没有 ffmpeg"');
+  } finally {
+    __setSpawnForTest(null);
+    __resetFfmpegProbe();
+  }
+});
+
+check('降采样：只在大图时动手（阈值内连 spawn 都不该发生）', async () => {
+  const dir = mkTemp('qq-pixiv-ds-small-');
+  const file = path.join(dir, 'small.bin');
+  fs.writeFileSync(file, Buffer.alloc(700 * 1024));   // < 800KB 阈值
+  let spawned = 0;
+  __setSpawnForTest(() => { spawned += 1; return null; });   // 一旦被调到就说明判错了
+  __resetFfmpegProbe();
+  try {
+    const r = await downsampleToJpeg(file, { overBytes: 800 * 1024 });
+    assert.equal(r.downsized, false);
+    assert.equal(r.bytes, 700 * 1024);
+    assert.equal(r.file, file, '阈值内必须原样返回同一个文件');
+    assert.equal(spawned, 0, '阈值内不该去 spawn 任何进程（连 ffmpeg 探测都不该做）');
+    assert.equal(fs.existsSync(file), true, '绝不该动原文件');
+  } finally {
+    __setSpawnForTest(null);
+    __resetFfmpegProbe();
+  }
+});
+
+check('降采样：ffmpeg 起不来时回落原图（**这条用例不需要 ffmpeg，任何机器都跑**）', async () => {
+  const dir = mkTemp('qq-pixiv-ds-nofail-');
+  const file = path.join(dir, 'big.jpg');
+  // 必须**真的超过阈值**才会走到 spawn 那一步（阈值内会提前返回，这条就空跑了）
+  fs.writeFileSync(file, Buffer.alloc(1024 * 1024));
+  // 造一个"启动就报错"的子进程，模拟 ffmpeg 不存在 / 没权限 / 被 AV 拦掉
+  const rejecting = rejectingSpawn();
+  __setSpawnForTest(rejecting);
+  __resetFfmpegProbe();
+  try {
+    // ⚠️ 必须**显式给 ffmpegPath**，不能只靠上面的假 spawn：
+    //    探针按"退出码 0"判可用，而这个假子进程既不报 error 也不退出 0 → 探测结论是
+    //    "没有 ffmpeg"，于是 downsampleToJpeg 在探测那一步就短路了、**根本走不到 spawn**，
+    //    这条用例量的就成了"没装 ffmpeg"而不是"起不来"（变异验证抓出来的空跑）。
+    const r = await downsampleToJpeg(file, { overBytes: 800 * 1024, ffmpegPath: 'ffmpeg' });
+    // ★ 核心断言：压缩没成 → **原图照旧可用**，绝不抛错、绝不丢图
+    assert.equal(r.downsized, false, 'ffmpeg 起不来时必须回落原图');
+    assert.equal(r.file, file, '回落的路径必须还是原文件');
+    assert.equal(r.bytes, 1024 * 1024, '回落的体积必须还是原体积');
+    assert.equal(fs.existsSync(file), true, '★ 压缩失败绝不能把原图删掉');
+    assert.ok(r.reason, '回落要说清原因（否则"卡片为什么只装了 3 页"又得从头查）');
+    // ⚠️ 必须钉住**是哪一种回落**：上面那句只断言"有原因"，而"这台机器上没有 ffmpeg"
+    //    与"ffmpeg 真的失败了"都会走到这里、都满足"有原因"。不写这一条的话，把
+    //    `!result.ok` 这个守卫改坏（失败被当成成功）这条用例照样绿 —— 变异验证抓出来的。
+    assert.match(r.reason, /启动失败/, `这条路径的回落原因必须是"ffmpeg 起不来"，实际：${r.reason}`);
+    assert.deepEqual([...fs.readdirSync(dir)], ['big.jpg'], '不该留下半成品文件');
+  } finally {
+    __setSpawnForTest(null);
+    __resetFfmpegProbe();
+  }
+});
+
+check('降采样：ffmpeg 说成功但**没产出文件**时也要回落原图（只看退出码是不够的）', async () => {
+  const dir = mkTemp('qq-pixiv-ds-nofile-');
+  const file = path.join(dir, 'big.jpg');
+  fs.writeFileSync(file, Buffer.alloc(1024 * 1024));   // 超过阈值，必须走到 spawn 那一步
+  // 造一个"退出码 0、但什么文件都没写"的子进程：真 ffmpeg 也会这样"悄悄地失败"
+  // （参数不对、编码器缺失、写到一半被杀…），所以只看退出码是不够的。
+  __setSpawnForTest(silentSuccessSpawn());
+  __resetFfmpegProbe();
+  try {
+    const r = await downsampleToJpeg(file, { overBytes: 800 * 1024, ffmpegPath: 'ffmpeg' });
+    assert.equal(r.downsized, false, '没产出文件就不能声称压缩成功');
+    assert.equal(r.file, file, '回落必须指向原文件');
+    assert.equal(r.bytes, 1024 * 1024, '回落的体积必须是原体积（不是那个不存在的产物）');
+    assert.equal(fs.existsSync(file), true, '★ 压缩没产出东西时绝不能把原图删掉');
+    assert.match(r.reason, /没有产出文件/, `原因要说清是"没产出"，实际：${r.reason}`);
+    assert.deepEqual([...fs.readdirSync(dir)], ['big.jpg'], '不该留下半成品文件');
+  } finally {
+    __setSpawnForTest(null);
+    __resetFfmpegProbe();
+  }
+});
+
+check('降采样：滤镜参数钉住"最长边 1200、只缩不放、取第 1 帧"', () => {
+  const args = buildDownsampleArgs('/in/x.png', '/out/y.jpg', { maxEdge: 1200, quality: 5 });
+  const vf = args[args.indexOf('-vf') + 1];
+  assert.match(vf, /min\(1200,iw\)/, '最长边要卡在 1200（宽度方向）');
+  assert.match(vf, /min\(1200,ih\)/, '最长边要卡在 1200（高度方向）');
+  assert.match(vf, /force_original_aspect_ratio=decrease/, '只缩不放：短边按比例');
+  assert.match(vf, /force_divisible_by=2/, 'mjpeg 要求两边都是偶数（奇数会直接报错）');
+  assert.equal(args[args.indexOf('-frames:v') + 1], '1', '静态图只取第 1 帧');
+  assert.equal(args[args.indexOf('-q:v') + 1], '5');
+  assert.equal(args[args.indexOf('-i') + 1], '/in/x.png');
+  assert.equal(args[args.length - 1], '/out/y.jpg');
+  // 参数必须收敛在合法区间：quality 是 ffmpeg 的 2..31，maxEdge 再小也不该小于 64
+  const lo = buildDownsampleArgs('a', 'b', { maxEdge: 1, quality: 999 });
+  assert.match(lo[lo.indexOf('-vf') + 1], /min\(64,iw\)/);
+  assert.equal(lo[lo.indexOf('-q:v') + 1], '31');
+  const hi = buildDownsampleArgs('a', 'b', { quality: -5 });
+  assert.equal(hi[hi.indexOf('-q:v') + 1], '2');
+});
+
+check('降采样（真压缩）：大图缩成 JPEG，最长边 1200、体积明显变小', async () => {
+  const dir = mkTemp('qq-pixiv-ds-real-');
+  const big = await makeBigImage(dir);
+  assert.ok(big, '第一步就得造出一张真的大图（造不出来说明这条用例本身有问题，不是被测代码的问题）');
+  assert.ok(big.bytes > 800 * 1024, `造的图要超过阈值才验得到压缩，实际 ${big.bytes} 字节`);
+
+  const r = await downsample(big.file, { overBytes: 800 * 1024, maxEdge: 1200, quality: 5 });
+  assert.equal(r.downsized, true, `应该真的压缩了（reason=${r.reason ?? '无'}）`);
+  assert.ok(r.bytes < big.bytes, `缩完必须更小：${big.bytes} → ${r.bytes}`);
+  assert.equal(r.bytes, fs.statSync(r.file).size, '返回的 bytes 要是盘上的真实大小');
+  assert.ok(isJpeg(r.file), '产物必须是 JPEG（SOI 0xFFD8）');
+  assert.equal(fs.existsSync(big.file), false, '缩完要替换掉原图（不让调用方看到两个文件）');
+  // ⚠️ "最长边 1200"这条只有**真的 ffmpeg** 才验得了：替身是自己写的，量它等于自证。
+  //    本机没装真 ffmpeg（用替身）时这一节整体跳过 —— 别把"替身说我缩对了"当结论。
+  if (!HAVE_REAL_FFMPEG) return;
+  // 用 ffprobe（与 ffmpeg 同目录的名字）量一下真实尺寸
+  const probe = path.join(path.dirname(FFMPEG), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+  const probed = await runProcess(probe, [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height', '-of', 'csv=p=0', r.file
+  ]);
+  if (probed.code !== 0) return;   // 没有 ffprobe 就不量尺寸（不是本用例的重点）
+  const raw = String(probed.stdout ?? '');
+  if (!/\d+,\d+/.test(raw)) return;
+  const [w, h] = raw.trim().split(',').map((n) => parseInt(n, 10));
+  assert.equal(Math.max(w, h), 1200, `最长边必须缩到 1200，实际 ${w}x${h}`);
+  assert.equal(w % 2, 0, `宽必须是偶数（mjpeg 要求），实际 ${w}`);
+  assert.equal(h % 2, 0, `高必须是偶数（mjpeg 要求），实际 ${h}`);
+}, NEED_FFMPEG);
+
+check('降采样（真压缩）：4MB 卡片预算下 5 页大图能全收进、并打包成一条卡片', async () => {
+  const dir = mkTemp('qq-pixiv-ds-card-');
+  const big = await makeBigImage(dir);
+  assert.ok(big, '造图失败');
+  assert.ok(big.bytes > 1500 * 1024,
+    `这条用例要的是"原图大到装不下几张"的现场，实际只有 ${big.bytes} 字节 —— 造图参数要调大`);
+  const pageBytes = fs.readFileSync(big.file);
+
+  internals.__setState([], []);
+  const { ctx, images, forwards } = fakeHostCtx();
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);   // 门面 sendForward 的路径守卫只认这个目录
+
+  const pid = '123450001';
+  const base = 'https://i.pixiv.re/img-master/img/2023/03/03/03/03/03';
+  const PAGES = 5;
+  const asked = [];
+  // 本机没装真 ffmpeg 时，把"spawn ffmpeg"接到替身上 —— 这样这条路走的仍然是**真的**
+  // "下载 → spawn ffmpeg → 检查产物 → 按最终体积记账 → 打包"，只是压缩器换了实现。
+  const restoreSpawn = HAVE_REAL_FFMPEG ? null : delegateSpawnToFake();
+  try {
+    await withFetch(
+      async (url) => {
+        const u = String(url);
+        asked.push(u);
+        if (u.includes('/setu/v2')) {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+            async json() {
+              return {
+                data: [{
+                  pid: Number(pid), p: 0, title: '多图大图', author: '作者', r18: false,
+                  tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+                }]
+              };
+            }
+          };
+        }
+        // 5 页都给**真实的大 JPEG 字节** —— 这样这条路走的就是真的"下载 → ffmpeg 压缩 → 记账"
+        if (new RegExp(`/${pid}_p[0-${PAGES - 1}]_`).test(u)) {
+          return fakeImageResponse({
+            contentType: 'image/jpeg',
+            contentLength: pageBytes.length,
+            body: chunkStream([new Uint8Array(pageBytes)])
+          });
+        }
+        return fakeImageResponse({ status: 404 });   // 第 6 页不存在 → 续页到此为止
+      },
+      () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+    );
+  } finally {
+    // 内存里的 PID 索引清干净（盘上那份在刚才那个临时状态目录里，不影响别的用例）
+    internals.__setState([], []);
+    if (restoreSpawn) restoreSpawn();
+  }
+
+  const paged = asked.filter((one) => one.includes(`_p`));
+  assert.equal(paged.length, PAGES + 1, `应该取了 5 页 + 探测第 6 页，实际请求 ${paged.length} 次`);
+  assert.equal(forwards.length, 1, '5 页大图该打包成**一条**卡片');
+  assert.equal(images.length, 0, '走卡片时不该再逐张发');
+  const nodes = forwards[0].payload.nodes;
+  assert.equal(nodes.length, PAGES + 1, '一条说明 + 5 张图');
+  // ★ 这条就是本轮改动的目的：缩过之后，5 页大图加起来还远在 4MB 预算之内
+  const total = nodes.filter((n) => n.data.content[0].type === 'image')
+    .reduce((sum, n) => sum + Buffer.byteLength(n.data.content[0].data.file.replace('base64://', ''), 'base64'), 0);
+  assert.ok(total < internals.DEFAULTS.forwardBudgetBytes,
+    `5 页缩完应该在 4MB 预算之内（实际 ${total} 字节）`);
+  assert.ok(total < pageBytes.length * PAGES / 2,
+    `缩过的总字节要明显小于原图之和（原图 ${pageBytes.length}×${PAGES}，实际 ${total}）`);
+}, NEED_FFMPEG);
+
+check('降采样（真压缩）：走逐张发那条路时，发的也是**缩小的**那个文件', async () => {
+  const dir = mkTemp('qq-pixiv-ds-send-');
+  const big = await makeBigImage(dir, 'single.jpg');
+  assert.ok(big && big.bytes > 800 * 1024, '造图失败或不够大');
+  internals.__setState([], []);
+  internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-ds-sendstate-')));
+  const calls = [];
+  // 同上：这条路要经过插件内部的 resolveFfmpeg()，替身必须接进 spawn
+  const restoreSpawn = HAVE_REAL_FFMPEG ? null : delegateSpawnToFake();
+  try {
+    const got = await withFetch(
+      async () => fakeImageResponse({
+        contentType: 'image/jpeg',
+        contentLength: big.bytes,
+        body: chunkStream([new Uint8Array(fs.readFileSync(big.file))])
+      }),
+      () => internals.__fetchImage({ pid: '99900001', imageUrl: 'https://i.pixiv.re/x_p0.jpg' },
+        { ...internals.DEFAULTS, timeoutMs: 3000 })
+    );
+    calls.push(got);
+    assert.equal(got.downsized, true, '取图这一步就该把它缩掉（预算是按最终体积算的）');
+    assert.ok(got.bytes < big.bytes, `返回的体积必须是缩过的：${big.bytes} → ${got.bytes}`);
+    // 以后面真正发送的那一段看到的就是这个路径 —— 它必须存在，且在插件状态目录之内
+    assert.equal(fs.existsSync(got.file), true, '缩过的文件得真的在盘上（否则发的时候才发现没了）');
+    assert.equal(path.dirname(path.resolve(got.file)), path.resolve(internals.__tempDir()));
+  } finally {
+    internals.__setState([], []);
+    if (restoreSpawn) restoreSpawn();
+  }
+}, NEED_FFMPEG);
+

@@ -46,6 +46,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 // 移植接口差异：这里原来还有 `import os from 'node:os'`（临时图片落在 os.tmpdir()）与
 // 一句从 `../../src/config.js` 取 `DATA_DIR` 的 import。前者随⑥一起没了，后者在本项目里
 // 那个模块根本不存在。
@@ -156,6 +157,26 @@ const DEFAULTS = {
   // （走 WebSocket 通道不假，但腾讯那边收下 10MB 也要时间）。**瓶颈在发送、不在下载**，
   // 所以这个值要按"发得动的卡片"来定，经验值约 4MB。
   forwardBudgetBytes: 4 * 1024 * 1024,
+  // ── 降采样（2026-10-08 第四轮：让 4MB 的卡片装得下 10+ 页）──────────────────
+  //
+  // 为什么需要：上面那条 `forwardBudgetBytes`（4MB）是按"卡片发得动"定的，而**多图作品的
+  // 每一页常常 1~2MB**（`regular` 档的 master1200 实测 1.4MB/页）—— 于是一张卡片只能装
+  // 2~3 页就顶到预算，`maxPages: 10` 这个设置形同虚设（2026-10-08 用户反馈的正是这件事）。
+  // 而 pixiv 的插画是**竖长图**，在 QQ 里显示宽度本来就只有屏幕宽 —— 1200px 最长边完全够看，
+  // 体积却从 1.4MB 掉到 300KB 上下：同样 4MB 的预算从 3 页变成 10+ 页。
+  //
+  // 每页下完后就地判、就地缩（见 `downsampleToJpeg`）：**失败一律回落原图**，
+  // 绝不因为压缩失败而丢图（这条是硬要求，用例 `降采样：ffmpeg 失败时回落原图` 盯着）。
+  //
+  // ⚠️ 这些键**不在 manifest 里**（本项目的 manifest 只认 8 个字段，见 README 第 3 节），
+  //    所以控制台没有对应的控件 —— 要改用 `config.json` 里
+  //    `plugins.settings.pixiv-illust` 那一节手加（改完要重启）。
+  /** 超过这个字节数才降采样（小图重编码一遍纯属白费 CPU、还可能越压越大）。~800KB。 */
+  downsampleOverBytes: 800 * 1024,
+  /** 降采样后的**最长边**（px），短边按比例、并强制偶数（libx264/mjpeg 的色度要求）。 */
+  downsampleMaxEdge: 1200,
+  /** JPEG 质量：ffmpeg 的 `-q:v`（2 最好、31 最差）。5 ≈ 300KB/1200px，肉眼够用。 */
+  downsampleQuality: 5,
   // 分级：多选（全年龄 / R18 / R18G），可选一个或多个、**至少一个**。
   // 只有勾上的档会发出来。旧字段 allowR18 仍保留在下面，只在配置里没有 ratings 时才读。
   ratings: ['safe'],
@@ -172,6 +193,10 @@ const DEFAULTS = {
   //   所以这里留 5MB 纯粹是因为"给群里发一张 12MB 的图"本身不礼貌（慢、而且对面要下），
   //   不是因为发不出去。想要原图尽管调大（例如 20971520），风险已经没有。
   //   （先前这个值被压到 1.3MiB 是**临时**对策 —— 那是在传输层还搬不动大图的年代。）
+  //
+  // ⚠️ 与下面的降采样（downsampleOverBytes）**不是一回事，别混**：这条是"下不下"，
+  //    降采样是"下完之后缩不缩"。所以超过这个值的页**依然取不到**（会去试下一个候选／档位），
+  //    而不是"下下来再缩" —— 想收更小的图请调 `imageSize`，想收大图再缩请调大这里。
   maxImageBytes: 5 * 1024 * 1024,
   // 取图的**尺寸档**（lolicon 接口的 size 参数）：original / regular / small / thumb / mini。
   //
@@ -1439,6 +1464,198 @@ function say(message) {
   try { api?.log?.info?.(message); } catch { /* 日志失败不影响主流程 */ }
 }
 
+// ── 降采样：> 阈值的大图缩成"最长边 N px 的 JPEG" ─────────────────────────
+//
+// 位置刻意放在**每一页下完之后**（fetchImage 里），而不是"要发送之前统一处理"：
+//   · 预算要在**收集时**按最终体积算（原先是按原图算，于是一页 1.4MB 只装得下 2~3 页）；
+//   · 回落逐张发那条路用的是同一批文件，缩过的文件两边都能直接用（缩完即替换，见下）。
+//
+// 三件事必须说清：
+//   ① **ffmpeg 是可选能力**：没有它就走原图那条路，功能一点不受影响（只是卡片装得少几页）。
+//      探测结果进程内缓存（含失败），失败 10 分钟后允许重探一次 —— 与宿主的
+//      `src/tools/image-downsample.js` 同一口径（这里是插件版的等价实现，不是新宿主能力）。
+//   ② **失败绝不丢图**：这一整套只返回 `{ ok: false, reason }`，**从不抛错**。
+//      调用方拿到 ok:false 就继续用原图 —— "压缩没成功"绝不该让一张图发不出去。
+//   ③ **缩完即替换**：成功时把原图删掉、返回新路径，于是调用方（以及后面的门面 sendImage /
+//      sendForward 的路径守卫）只会看到一个文件。原图本来也只是个临时文件（sweepTemp 会清）。
+//
+// 为什么输出走**临时文件**而不是 `pipe:1`：与宿主那条路同一个理由 —— 有些发行版的 ffmpeg
+// 解某些输入（GIF 等）需要可 seek 的输入，从管道直读会报 "Input/output error"。
+// 而这个插件自己的临时目录里写文件是零成本的（原图就落在那儿）。
+
+const FFMPEG_PROBE_TTL_MS = 10 * 60 * 1000;
+let ffmpegProbe = { at: 0, path: null, failed: false };
+/** 测试用：清掉 ffmpeg 探测缓存（每个用例要自己决定"这台机器有没有 ffmpeg"）。 */
+export function __resetFfmpegProbe() { ffmpegProbe = { at: 0, path: null, failed: false }; }
+/** 探测与调用都走这里 —— 一个模块级的句柄，测试可以临时换掉（不用去 mock node:child_process）。 */
+let spawnImpl = spawn;
+/** 测试用：换掉 spawn（传 null 恢复真的）。**只为"ffmpeg 起不来"那条用例存在**。 */
+export function __setSpawnForTest(fn) { spawnImpl = typeof fn === 'function' ? fn : spawn; }
+
+/**
+ * 探测系统的 ffmpeg，返回**可直接 spawn 的路径**（探测不到返回空串）。
+ *
+ * 先试 `ffmpeg`（走 PATH，Linux 上就是 /usr/bin/ffmpeg），失败再试常见绝对路径 --
+ * 服务的 PATH 可能比登录 shell 窄（systemd 用户服务尤其容易），只靠 PATH 会误判"没装"。
+ *
+ * ⚠️ 判据是**退出码 0**，**不是** `error` 事件：`stdio: 'ignore'` 下 spawn 一个不存在的
+ * 可执行文件**不会**发 error（那是 fd 接管的代价），只会以非 0（通常是 127）退出。
+ * 第一版按"没有 error 事件 = 可用"写，于是**没装 ffmpeg 的机器也被判成装了**，
+ * 表现是"降采样看起来生效了、其实一张都没缩"—— 比报错难查得多（本机实测抓到）。
+ */
+export async function resolveFfmpeg() {
+  const cached = ffmpegProbe.path;
+  if (cached && Date.now() - ffmpegProbe.at < FFMPEG_PROBE_TTL_MS) return cached;
+  // 缓存了"没有"：TTL 内别再每次花一次 spawn 去试（装好后最多等 10 分钟自动恢复）
+  if (!cached && ffmpegProbe.failed && Date.now() - ffmpegProbe.at < FFMPEG_PROBE_TTL_MS) return '';
+  ffmpegProbe = { at: Date.now(), path: null, failed: false };
+  const candidates = process.platform === 'win32'
+    ? ['ffmpeg', 'ffmpeg.exe']
+    : ['ffmpeg', '/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/bin/ffmpeg'];
+  for (const bin of candidates) {
+    const ok = await new Promise((resolve) => {
+      let child = null;
+      try {
+        child = spawnImpl(bin, ['-version'], { stdio: 'ignore', windowsHide: true });
+      } catch { resolve(false); return; }
+      let settled = false;
+      const done = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+      // ⚠️ 定时器必须自己兜底 resolve：kill 之后进程若成僵尸就永远没有 exit 事件，
+      //    这里挂住会让整条取图链路一起挂住（比"探测失败"严重得多）。
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch { /* 已经退出 */ }
+        done(false);
+      }, 5000);
+      timer.unref?.();
+      child.on('error', () => done(false));          // 同步 EINVAL / 权限类失败会走这里
+      child.on('exit', (code) => done(code === 0));  // 不存在 → 非 0（127）
+    });
+    if (ok) {
+      ffmpegProbe.path = bin;
+      return bin;
+    }
+  }
+  ffmpegProbe.failed = true;
+  return '';
+}
+
+/** 降采样要用到的滤镜/参数（导出是为了让用例能钉住"最长边 1200、短边按比例且为偶数"）。 */
+export function buildDownsampleArgs(inputPath, outputPath, { maxEdge = 1200, quality = 5 } = {}) {
+  const edge = Math.max(64, Math.round(Number(maxEdge) || 1200));
+  const q = Math.min(31, Math.max(2, Math.round(Number(quality) || 5)));
+  return [
+    '-hide_banner', '-loglevel', 'error',
+    // -y：输出名带随机后缀，正常不会撞名；但撞上了（比如上一次同秒的残留）不该卡住等输入
+    '-y',
+    '-i', inputPath,
+    // 只缩不放：`min(1200,iw)` / `min(1200,ih)` 保证小图永远不会被拉大
+    // （拉大只会更糊、更大，纯亏）；force_divisible_by=2 让两边都是偶数
+    // （mjpeg 的色度采样要求偶数，奇数会直接报错）。
+    '-vf', `scale='min(${edge},iw)':'min(${edge},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
+    // 静态图取第 1 帧：GIF/动图 WebP 走这条路时只留一帧（尺寸缩了、动画也会丢，
+    // 这是**刻意的取舍**：多图作品的页大多是静态图，而 2MB 的动图本来就进不了卡片）。
+    '-frames:v', '1',
+    '-q:v', String(q),
+    '-f', 'image2', '-y', outputPath
+  ];
+}
+
+/** 在给定上限内跑一次 ffmpeg，返回 { ok, reason }（**不抛错**：调用方只需要知道成没成）。 */
+function runFfmpegToFile(ffmpegPath, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let child = null;
+    try {
+      child = spawnImpl(ffmpegPath, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (error) {
+      resolve({ ok: false, reason: `ffmpeg 起不来：${error?.message ?? error}` });
+      return;
+    }
+    let stderr = '';
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    // ⚠️ 这个定时器**不** unref，也一定要清：它是唯一的超时保护，而缩放一张图只要几百毫秒，
+    //    10 秒还没完就是异常（宁可回落原图，也不能把 60 秒的工具预算耗在这儿）。
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* 已经退出 */ }
+      done({ ok: false, reason: `ffmpeg 超时（${timeoutMs}ms）` });
+    }, timeoutMs);
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+      // 只留尾部：ffmpeg 的真实报错在最后一行，头部全是 banner 噪音
+      if (stderr.length > 2000) stderr = stderr.slice(-2000);
+    });
+    child.on('error', (error) => done({ ok: false, reason: `ffmpeg 启动失败：${error?.message ?? error}` }));
+    child.on('close', (code) => done(
+      code === 0
+        ? { ok: true }
+        : { ok: false, reason: `ffmpeg 退出码 ${code}：${stderr.trim().split('\n').pop() || '无错误输出'}` }
+    ));
+  });
+}
+
+/**
+ * 一张图太大就缩成"最长边 N px 的 JPEG"，成功时**替换掉原文件**。
+ *
+ * @returns {Promise<{file, bytes, downsized, reason?, fromBytes?, fromFile?}>}
+ *   `downsized: true` 时 `file`/`bytes` 指向缩过的 JPEG（原图已删）；
+ *   `downsized: false` 时 `file`/`bytes` **就是原图**（阈值内 / 没有 ffmpeg / 压缩失败），
+ *   并在 `reason` 里说明原因（只用于日志，调用方不需要分情况处理）。
+ *
+ * **这个函数从不抛错**（"压缩失败"是这条链路上最不该致命的事情）。
+ */
+export async function downsampleToJpeg(file, {
+  overBytes = 800 * 1024,
+  maxEdge = 1200,
+  quality = 5,
+  timeoutMs = 10000,
+  // 显式指定 ffmpeg（测试用：让"真压缩"那几条用例**不必**依赖"这台机器装没装 ffmpeg"）。
+  // 生产路径不传，走 resolveFfmpeg() 的探测。
+  ffmpegPath = ''
+} = {}) {
+  const src = String(file ?? '');
+  let stat = null;
+  try { stat = fs.statSync(src); } catch (error) {
+    return { file: src, bytes: 0, downsized: false, reason: `读不到文件（${error?.message ?? error}）` };
+  }
+  const size = Number(stat.size) || 0;
+  const limit = Math.max(0, Number(overBytes) || 0);
+  // 小图不动：重编码一遍既费 CPU，又可能**越压越大**（几百 KB 的 PNG 转 JPEG 不一定更小）
+  if (limit && size <= limit) return { file: src, bytes: size, downsized: false };
+
+  const bin = String(ffmpegPath ?? '').trim() || await resolveFfmpeg();
+  if (!bin) return { file: src, bytes: size, downsized: false, reason: '这台机器上没有 ffmpeg' };
+
+  const dir = path.dirname(src);
+  const base = path.basename(src).replace(/\.[a-z0-9]+$/i, '');
+  // 输出名带 `-ds` 与随机后缀：同一次运行里多页并行/重名时不会互相覆盖
+  const out = path.join(dir, `${base}-ds_${Math.random().toString(36).slice(2, 8)}.jpg`);
+  let result;
+  try {
+    result = await runFfmpegToFile(bin, buildDownsampleArgs(src, out, { maxEdge, quality }), timeoutMs);
+  } catch (error) {
+    result = { ok: false, reason: `ffmpeg 调用失败：${error?.message ?? error}` };
+  }
+  let outBytes = 0;
+  try { outBytes = fs.statSync(out).size; } catch { outBytes = 0; }
+  if (!result.ok || !outBytes) {
+    try { fs.rmSync(out, { force: true }); } catch { /* 尽力清理 */ }
+    return { file: src, bytes: size, downsized: false, reason: result.reason || 'ffmpeg 没有产出文件' };
+  }
+  // 缩完反而更大（极端情况：小尺寸的高压缩原图）→ 放弃，继续用原图
+  if (outBytes >= size) {
+    try { fs.rmSync(out, { force: true }); } catch { /* 尽力清理 */ }
+    return { file: src, bytes: size, downsized: false, reason: `缩完更大（${outBytes} ≥ ${size}）` };
+  }
+  // 替换：原图删掉。**先确认新文件在**再删（顺序反了就可能两个都没了 —— 绝不能丢图）。
+  try { fs.rmSync(src, { force: true }); } catch { /* 删不掉就留着，sweepTemp 稍后清 */ }
+  return { file: out, bytes: outBytes, downsized: true, fromBytes: size, fromFile: src };
+}
+
 /**
  * 取一张作品的图：先按尺寸档试图床给的地址（从大到小），最后才落到 PID 模板。
  *
@@ -1477,9 +1694,26 @@ async function fetchImage(item, s, { allowTemplate = true } = {}) {
         api?.log?.info?.(`[pixiv-illust] 取图成功 ${item.pid}：${Math.round(got.bytes / 1024)}KB`
           + `（第 ${i + 1}/${urls.length} 个候选，档位 ${s.imageSize}）`);
       } catch { /* 日志失败不影响取图 */ }
+      // ── 下完就地降采样（2026-10-08 第四轮）────────────────────────────────
+      // ⚠️ 位置很要紧：必须在**返回之前**，因为调用方（多图续页）要用**最终体积**做预算。
+      //    放在"发送之前"就晚了 —— 那时预算早就按原图算完，一页 1.4MB 只装得下 2~3 页。
+      // ⚠️ downsampleToJpeg **从不抛错**：失败/没装 ffmpeg 都回到原图那条路（绝不丢图）。
+      const final = await downsampleToJpeg(got.file, {
+        overBytes: s.downsampleOverBytes,
+        maxEdge: s.downsampleMaxEdge,
+        quality: s.downsampleQuality
+      });
+      if (final.downsized) {
+        say(`[pixiv-illust] ${item.pid} 第 ${i + 1} 个候选降采样：`
+          + `${Math.round(final.fromBytes / 1024)}KB → ${Math.round(final.bytes / 1024)}KB`
+          + `（最长边 ${Math.max(64, Math.round(Number(s.downsampleMaxEdge) || 1200))}px JPEG）`);
+      } else if (final.reason) {
+        // **回落要出声**：不吭声的话"卡片为什么只装了 3 页"又得从头查一遍
+        say(`[pixiv-illust] ${item.pid} 降采样跳过（${final.reason}），按原图 ${Math.round(final.bytes / 1024)}KB 继续`);
+      }
       // 把**实际用到的地址**一并带出去：多图续页要靠它认出日期路径，而"给 pid/链接"那条路
       // 的日期路径只存在于这里（它没有接口给的 imageUrl）——不带出去，那条路就永远只有第 1 页。
-      return { ...got, url: urls[i] };
+      return { ...got, file: final.file, bytes: final.bytes, downsized: final.downsized, url: urls[i] };
     } catch (error) {
       last = error;
       if (error?.hardNetError) break;
@@ -1523,8 +1757,19 @@ export async function activate(hostApi) {
     const mb = (n) => `${(Number(n) / 1048576).toFixed(1)}MB`;
     api.log?.info?.(`生效设置：imageSize=${s.imageSize} maxImageBytes=${mb(s.maxImageBytes)}`
       + ` maxCount=${s.maxCount} maxPages=${s.maxPages} timeoutMs=${s.timeoutMs} retryCandidates=${s.retryCandidates}`
+      + ` 卡片预算=${mb(s.forwardBudgetBytes)} 降采样=>${mb(s.downsampleOverBytes)}/${s.downsampleMaxEdge}px`
       + '（改这些要重启才生效）');
   }
+  // 顺带把"这台机器有没有 ffmpeg"打出来：它决定"卡片能装 3 页还是 10+ 页"，
+  // 而这件事从别处完全看不出来（没装的话只是卡片小，不会报任何错）。
+  resolveFfmpeg().then((bin) => {
+    try {
+      api.log?.info?.(bin
+        ? `降采样可用：ffmpeg = ${bin}（每页 > ${Math.round(Number(settings().downsampleOverBytes) / 1024)}KB 就缩成 `
+          + `最长边 ${settings().downsampleMaxEdge}px 的 JPEG，4MB 卡片约能装 10+ 页）`
+        : '这台机器上没有 ffmpeg —— 大图按原样发（功能不受影响，只是同样 4MB 的卡片少装几页）');
+    } catch { /* 日志失败不影响任何事 */ }
+  }).catch(() => { /* 探测本身有问题也不影响 activate */ });
 
   api.registerTool({
     // 移植接口差异：原版是 registerTool({ id: 'pixiv_image', name: 'Pixiv 来张图',
@@ -1911,7 +2156,10 @@ export const internals = {
   resolveProxyUrl, describeFetchError, breakerState, dispatcherFor,
   needsPixivReferer, searchHttpError, requestHeaders, __doFetch: doFetch, __requestJson: requestJson,
   __fetchImage: fetchImage, __downloadToTemp: downloadToTemp,
-  // ── 状态目录（移植新增）────────────────────────────────────────────────
+  // ── 降采样（2026-10-08 第四轮）──────────────────────────────────────────
+  // 查"为什么卡片只装了 3 页"时，这几个是唯一能单独跑一遍的入口。
+  resolveFfmpeg, buildDownsampleArgs, downsampleToJpeg,
+  __resetFfmpegProbe, __setSpawnForTest,  // ── 状态目录（移植新增）────────────────────────────────────────────────
   // 原来这里是 `__chatRatingsFile: CHAT_RATINGS_FILE`（模块常量）。现在两个路径都由
   // setStateDir() 现算，所以改成函数与 setter —— 测试要在自己的临时目录上跑，
   // 直接调 __setStateDir(tmp) 即可（不用碰真实数据目录）。
