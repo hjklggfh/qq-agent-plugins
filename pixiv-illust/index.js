@@ -1483,7 +1483,7 @@ export async function activate(hostApi) {
     const s = settings();
     const mb = (n) => `${(Number(n) / 1048576).toFixed(1)}MB`;
     api.log?.info?.(`生效设置：imageSize=${s.imageSize} maxImageBytes=${mb(s.maxImageBytes)}`
-      + ` maxCount=${s.maxCount} timeoutMs=${s.timeoutMs} retryCandidates=${s.retryCandidates}`
+      + ` maxCount=${s.maxCount} maxPages=${s.maxPages} timeoutMs=${s.timeoutMs} retryCandidates=${s.retryCandidates}`
       + '（改这些要重启才生效）');
   }
 
