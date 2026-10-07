@@ -24,6 +24,7 @@
   （实测：某 pid 在 `pixiv.re` 和 `i.pixiv.re` 两个域名上都是 404，作品本身没了）。
   每张作品都会先试后端给的原图地址、再试 PID 模板，都失败就自动换下一张备选；
   那种作品会被拉黑一段时间（默认 7 天），同一个关键词再问会换别的图，而不是整个请求失败。
+- **多图作品自动打包成一条「聊天记录」**：一个作品最多发 `maxPages` 页（默认 4），页码从 0 连续排、逐页试到取不到为止。宿主有 `chat:send-forward` 能力时打包成**一条卡片**（不刷屏）；没有这个能力、或协议端不支持那个 action 时**回落逐张发**，一张都不丢。`maxPages: 1` 就回到"只发第一张"。
 - **按会话分级**（全年龄 / R18 / R18G），由 `pixiv_set_rating` 维护，**只有主人能改**。
 - **可选：pixiv.net 原生搜索**，元信息更全（**含收藏数**）。但 `www.pixiv.net` 在大陆直连不通，
   且 Node 的 fetch **默认不读 `HTTPS_PROXY`**，所以就算系统挂着梯子也得在设置里填「代理地址」
@@ -58,7 +59,7 @@
     "approved": {
       "pixiv-illust": {
         "version": "1.6.0",
-        "capabilities": ["chat:read", "chat:send-image", "http", "storage"],
+        "capabilities": ["chat:read", "chat:send-forward", "chat:send-image", "http", "storage"],
         "tools": ["pixiv_image", "pixiv_set_rating"]
       }
     },

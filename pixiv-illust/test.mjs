@@ -294,6 +294,7 @@ function fakeHostCtx(overrides = {}) {
   const sends = [];
   const emitted = [];
   const session = { id: 'sess-1', leaseId: 'lease-1', rounds: 3, sent: [], triggerText: '在吗' };
+  const forwards = [];
   const ctx = {
     chatKey: 'group:12345',
     kind: 'group',
@@ -310,6 +311,10 @@ function fakeHostCtx(overrides = {}) {
       async image(chatKey, payload, options) {
         images.push({ chatKey, payload, options });
         return { message_id: 4242 };
+      },
+      async forward(chatKey, payload, options) {
+        forwards.push({ chatKey, payload, options });
+        return { message_id: 4343 };
       }
     },
     store: {
@@ -327,7 +332,7 @@ function fakeHostCtx(overrides = {}) {
     session,
     ...overrides
   };
-  return { ctx, images, sends, emitted, session };
+  return { ctx, images, forwards, sends, emitted, session };
 }
 
 function makeToolCtx(hostCtx) {
@@ -906,7 +911,7 @@ check('装载器全流程：带审批 initPlugins → loaded，注入的工具�
   const status = result.statuses.find((item) => item.id === 'pixiv-illust');
   assert.ok(status, '装载器应该发现 plugins/pixiv-illust');
   assert.equal(status.status, 'loaded', `期望 loaded，实际 ${status.status}：${status.reason}`);
-  assert.deepEqual(status.capabilities, ['chat:read', 'chat:send-image', 'http', 'storage']);
+  assert.deepEqual(status.capabilities, ['chat:read', 'chat:send-forward', 'chat:send-image', 'http', 'storage']);
   assert.deepEqual(status.tools, ['pixiv_image', 'pixiv_set_rating']);
   assert.deepEqual(result.toolDefs.map((def) => def.name).sort(), pluginToolNames);
   // 同一个自建根里的另一个插件（my-first-plugin）也在，未启用就是 disabled
@@ -962,16 +967,16 @@ check('imageCandidates：取第 2 页起必须关掉 PID 模板（否则会重�
   assert.deepEqual(imageCandidates(item, 'https://pixiv.re/{pid}.png', { allowTemplate: false }), page2);
 });
 
-check('多图作品：第 1 张之后自动续发后面几页，取不到就停，且绝不重复发第 1 页', async () => {
+check('多图作品：有合并转发能力时打包成**一条**聊天记录（不刷屏）', async () => {
   internals.__setState([], []);            // PID 索引清空（否则这张作品会被当成"已发过"）
   const pid = '94101307';
   const base = 'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15';
   const asked = [];
-  const { ctx, images } = fakeHostCtx();
+  const { ctx, images, forwards } = fakeHostCtx();
   const toolCtx = makeToolCtx(ctx);
-  // ⚠️ 状态目录必须用**门面**给的那个（toolCtx.dir）：门面的 sendImage({path}) 有路径守卫，
-  //    只接受 pluginStateDir(dataDir, id) 之内的文件。自己 mkdtemp 一个会**每一张都被拒**
-  //    （症状是"一张都没发出去"，跟本次要验的东西完全无关 —— 第一次就踩了）。
+  // ⚠️ 状态目录必须用**门面**给的那个（toolCtx.dir）：门面的 sendForward({path}) 有路径守卫，
+  //    只接受 pluginStateDir(dataDir, id) 之内的文件。自己 mkdtemp 一个会**每一条都被拒**，
+  //    于是回落逐张发 —— 症状看着像"转发没生效"，其实与转发无关。
   internals.__setStateDir(toolCtx.dir);
 
   await withFetch(
@@ -1001,18 +1006,141 @@ check('多图作品：第 1 张之后自动续发后面几页，取不到就停�
     () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
   );
 
-  assert.equal(images.length, 2, `该发第 1、2 页（第 3 页 404 就停），实际发了 ${images.length}`);
-  assert.equal(images[0].payload.bytes, 1000, '第一张是第 1 页');
-  assert.equal(images[1].payload.bytes, 2000, '第二张是第 2 页');
-  assert.match(images[1].payload.label, /第 2 页/, '续页的文案要标出页号');
-  // 这条是防"多图变重复图"的关键：模板只给第 0 页，一旦回退到它就会把第 1 页再发一遍
-  assert.ok(!asked.some((one) => one.includes('pixiv.re/94101307.png')),
-    `绝不该请求 PID 模板，实际请求过：${asked.filter((one) => one.includes('pixiv.re')).join(', ')}`);
+  assert.equal(forwards.length, 1, '多图作品该走**一条**合并转发');
+  assert.equal(images.length, 0, '走转发时不该再逐张发（否则等于既刷屏又多一条）');
+  const nodes = forwards[0].payload.nodes;
+  assert.equal(nodes.length, 3, '一条说明 + 两张图 = 3 个 node');
+  assert.match(nodes[0].data.content[0].data.text, /有 2 页/, '第一个 node 说明这个作品有几页');
+  assert.equal(nodes[1].data.content[0].type, 'image');
+  assert.equal(nodes[2].data.content[0].type, 'image');
+  assert.equal(nodes[1].data.name, '小鲸鱼', '显示名由宿主填');
   // 遇到"这一页不存在"必须**立刻停**：不然后面每一页都要白等一整个超时
-  // （maxPages=4 时会去试 _p3_）。第一次写这条用例时只验了"发了几张"，漏掉了这一半 ——
-  // 是变异测试（把 break 去掉）没被抓住才发现的。
   assert.ok(!asked.some((one) => one.includes(`/${pid}_p3_`)),
     `第 3 页已经 404，不该再去试第 4 页。实际请求过：${asked.filter((one) => one.includes('_p')).join(', ')}`);
+  assert.ok(!asked.some((one) => one.includes('pixiv.re/94101307.png')),
+    '绝不该请求 PID 模板（那会重复发第 1 页）');
+});
+
+check('单图作品：就算有转发能力也**不要**套一层卡片（一张图不值得）', async () => {
+  internals.__setState([], []);
+  const pid = '55500001';
+  const base = 'https://i.pixiv.re/img-master/img/2022/02/02/02/02/02';
+  const { ctx, images, forwards } = fakeHostCtx();
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);
+
+  await withFetch(
+    async (url) => {
+      const u = String(url);
+      if (u.includes('/setu/v2')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+          async json() {
+            return {
+              data: [{
+                pid: Number(pid), p: 0, title: '单图作品', author: '作者', r18: false,
+                tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+              }]
+            };
+          }
+        };
+      }
+      if (u.includes(`/${pid}_p0_`)) return fakeImageResponse({ contentLength: 500, body: chunkStream([new Uint8Array(500)]) });
+      if (u.includes(`/${pid}_p1_`)) return fakeImageResponse({ status: 404 });   // 只有一页
+      throw new Error(`不该请求这个地址：${u}`);
+    },
+    () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+  );
+
+  assert.equal(forwards.length, 0, '单页作品不该为了一张图套一层"聊天记录"');
+  assert.equal(images.length, 1);
+  assert.equal(images[0].payload.bytes, 500);
+});
+
+check('多图作品：宿主没有合并转发能力时，回落逐张发（一张都不丢）', async () => {
+  internals.__setState([], []);
+  const pid = '94101307';
+  const base = 'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15';
+  const { ctx, images, forwards } = fakeHostCtx();
+  // 模拟**旧宿主**：门面上没有 sendForward（能力没声明/宿主版本老）
+  const toolCtx = { ...makeToolCtx(ctx) };
+  delete toolCtx.sendForward;
+  internals.__setStateDir(toolCtx.dir);
+
+  await withFetch(
+    async (url) => {
+      const u = String(url);
+      if (u.includes('/setu/v2')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+          async json() {
+            return {
+              data: [{
+                pid: Number(pid), p: 0, title: '多图作品', author: '作者', r18: false,
+                tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+              }]
+            };
+          }
+        };
+      }
+      if (u.includes(`/${pid}_p0_`)) return fakeImageResponse({ contentLength: 1000, body: chunkStream([new Uint8Array(1000)]) });
+      if (u.includes(`/${pid}_p1_`)) return fakeImageResponse({ contentLength: 2000, body: chunkStream([new Uint8Array(2000)]) });
+      if (u.includes(`/${pid}_p2_`)) return fakeImageResponse({ status: 404 });
+      throw new Error(`不该请求这个地址：${u}`);
+    },
+    () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+  );
+
+  assert.equal(forwards.length, 0, '没有能力就不该用转发');
+  assert.equal(images.length, 2, '回落逐张发：两张都要发出去，一张都不能丢');
+  assert.equal(images[0].payload.bytes, 1000);
+  assert.equal(images[1].payload.bytes, 2000);
+  assert.match(images[1].payload.label, /第 2 页/);
+});
+
+check('多图作品：转发失败（协议端不支持那个 action）时也回落逐张发', async () => {
+  internals.__setState([], []);
+  const pid = '94101307';
+  const base = 'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15';
+  const { ctx, images } = fakeHostCtx();
+  const toolCtx = makeToolCtx(ctx);
+  // 门面上有 sendForward，但它一调就抛（协议端不认这个 action 的现场）
+  toolCtx.sendForward = async () => { throw new Error('OneBot send_group_forward_msg 失败: unsupported action'); };
+  internals.__setStateDir(toolCtx.dir);
+
+  await withFetch(
+    async (url) => {
+      const u = String(url);
+      if (u.includes('/setu/v2')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+          async json() {
+            return {
+              data: [{
+                pid: Number(pid), p: 0, title: '多图作品', author: '作者', r18: false,
+                tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+              }]
+            };
+          }
+        };
+      }
+      if (u.includes(`/${pid}_p0_`)) return fakeImageResponse({ contentLength: 1000, body: chunkStream([new Uint8Array(1000)]) });
+      if (u.includes(`/${pid}_p1_`)) return fakeImageResponse({ contentLength: 2000, body: chunkStream([new Uint8Array(2000)]) });
+      if (u.includes(`/${pid}_p2_`)) return fakeImageResponse({ status: 404 });
+      throw new Error(`不该请求这个地址：${u}`);
+    },
+    () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+  );
+
+  assert.equal(images.length, 2, '转发失败必须回落，否则一条卡片失败就一张图都发不出去');
+  assert.equal(images[0].payload.bytes, 1000);
+  assert.equal(images[1].payload.bytes, 2000);
 });
 
 // ── 5MB→1.3MiB 那个上限、以及"给 pid 时推出尺寸版"（2026-10-08 第二轮）────────

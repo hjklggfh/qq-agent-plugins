@@ -1605,36 +1605,25 @@ export async function activate(hostApi) {
             // 优先用后端自带的原图地址（带日期路径 + 页码），不行再退回 PID 模板 —— 两条路都试
             const got = await fetchImage(it, s);
             const note = formatNote(it);
-            // 移植接口差异：原来是 `ctx.sender.sendImage(ctx.chatKey, { file: got.file }, { note })`。
-            // 本项目走门面：`{ path }`（必须落在插件状态目录里，见 tempDir 的注释）+
-            // `{ label }`。门面自己会做记账（push 进 session.sent + 广播 session-update），
-            // 所以原来紧跟其后的 `ctx.session.sent.push(...)` 与循环后的
-            // `ctx.emit('session-update', ...)` 都删掉了 —— 重复记账会出现两条。
-            await toolCtx.sendImage({ path: got.file }, { label: note });
-            // 只有真的发出去了才记账 —— 失败不记，否则一次网络抖动就把这张图永久跳过
-            markSeen(it.pid);
-            done.push({ pid: it.pid, title: it.title, author: it.author, bookmarks: Number.isFinite(it.bookmarks) ? it.bookmarks : null });
+            // 「给 pid/链接」那条路的日期路径只存在于"实际取到的那条地址"里（见 fetchImage 的
+            // 返回）—— 补回条目上，续页才认得出来。接口给过地址的那条路本来就不缺它。
+            if (!String(it.imageUrl ?? '').trim() && got.url) it.imageUrl = got.url;
 
-            // ③.5 多图作品：接着发第 2..maxPages 页。
+            // ③.5 多图作品：把第 2..maxPages 页也取回来。
             //
             // 为什么逐页试而不是"按总页数循环"：接口只给 `p`（这一页的页号），**不给张数**。
             // 好在页码从 0 连续排，所以从第 1 页起一页页试、遇到"这一页不存在"就停即可 ——
             // 单图作品只多花一次请求，而那次请求本来就是它要取的那一页。
-            //
-            // 三条硬约束：
-            //   · 第 2 页起必须关掉 PID 模板（模板只给第 0 页，否则会重复发第一张）；
-            //   · 后页失败**不回滚**已经发出去的第一页，也不计入 failed（那不是"图都没发出去"）；
-            //   · 认不出日期路径就直接放弃续页（拼不出别的页码）。
+            // 三条硬约束：① 第 2 页起必须关掉 PID 模板（模板只给第 0 页，否则会重复发第一张）；
+            // ② 后页取不到**不影响**已经取到的第一页；③ 认不出日期路径就放弃续页。
             const maxPages = Math.max(1, Math.round(Number(s.maxPages) || 1));
-            // 「给 pid/链接」那条路的日期路径只存在于"实际取到的那条地址"里（见 fetchImage 的
-            // 返回）—— 补回条目上，续页才认得出来。接口给过地址的那条路本来就不缺它。
-            if (!String(it.imageUrl ?? '').trim() && got.url) it.imageUrl = got.url;
+            const extraPages = [];
             for (let page = 1; page < maxPages; page += 1) {
               const pageUrls = pageUrlsOf(it, page, s.imageSize);
               if (!pageUrls.length) break;
               try {
                 const more = await fetchImage({ ...it, imageUrl: '', imageUrls: pageUrls }, s, { allowTemplate: false });
-                await toolCtx.sendImage({ path: more.file }, { label: `${note}（第 ${page + 1} 页）` });
+                extraPages.push({ file: more.file, page });
               } catch (error) {
                 const status = Number(error?.status) || 0;
                 // 404/410 = 这个作品没有这一页 → 正常结束（不记日志，那是预期的边界）
@@ -1645,6 +1634,44 @@ export async function activate(hostApi) {
                 break;
               }
             }
+
+            // 怎么发：
+            //   · 多页且宿主有 chat:send-forward（门面挂了这个方法）→ 打包成**一条**「聊天记录」，
+            //     群里只占一条卡片（这正是那个能力存在的理由）；
+            //   · 否则（旧宿主没这个能力，或转发失败 —— 协议端不支持那个 action）→ **回落逐张发**，
+            //     一张都不丢。这条回落是刻意的：能力缺失不该让功能变成"什么都发不出来"。
+            //
+            // 移植接口差异：原来是 `ctx.sender.sendImage(ctx.chatKey, { file }, { note })`。
+            // 本项目走门面：`{ path }`（必须落在插件状态目录里，见 tempDir 的注释）+ `{ label }`。
+            // 门面自己会做记账（push 进 session.sent + 广播 session-update），所以原来紧跟其后的
+            // `ctx.session.sent.push(...)` 与循环后的 `ctx.emit('session-update', ...)` 都删掉了
+            // —— 重复记账会出现两条。
+            let sentViaForward = false;
+            if (extraPages.length && typeof toolCtx.sendForward === 'function') {
+              try {
+                await toolCtx.sendForward({
+                  items: [
+                    { text: `${note}（这个作品有 ${extraPages.length + 1} 页）` },
+                    { path: got.file },
+                    ...extraPages.map((one) => ({ path: one.file }))
+                  ],
+                  label: note
+                });
+                sentViaForward = true;
+              } catch (error) {
+                say(`[pixiv-illust] ${it.pid} 合并转发失败（${String(error?.message ?? error).slice(0, 60)}）`
+                  + '，回落逐张发');
+              }
+            }
+            if (!sentViaForward) {
+              await toolCtx.sendImage({ path: got.file }, { label: note });
+              for (const one of extraPages) {
+                await toolCtx.sendImage({ path: one.file }, { label: `${note}（第 ${one.page + 1} 页）` });
+              }
+            }
+            // 只有真的发出去了才记账 —— 失败不记，否则一次网络抖动就把这张图永久跳过
+            markSeen(it.pid);
+            done.push({ pid: it.pid, title: it.title, author: it.author, bookmarks: Number.isFinite(it.bookmarks) ? it.bookmarks : null });
           } catch (error) {
             const status = Number(error?.status) || 0;
             // 404 是"作品本身没了"，不是线路问题 —— 拉黑它，否则同一个关键词每次都会再挑到这张死图
