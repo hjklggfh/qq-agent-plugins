@@ -1967,10 +1967,15 @@ check('降采样（真压缩）：缩完的页能全收进**一条卡片**，且
   // 卡片里的字节总和必须严格小于"原图总量" —— 这就是**缩过**的铁证（也再次钉住记账口径）。
   assert.ok(total < pageBytes.length * PAGES,
     `卡片里的合计必须小于原图之和（原图 ${pageBytes.length}×${PAGES}，实际 ${total}）`);
-  // 把实测值打出来：**这个数就是"4MB 能装几页"的依据**，比任何说明都直接
-  console.log(`    [实测] 原图 ${Math.round(big.bytes / 1024)}KB/页 → 缩后 ${Math.round(pageCost / 1024)}KB/页；`
+  // 把实测值打出来：**这个数就是"4MB 能装几页"的依据**，比任何说明都直接。
+  // ⚠️ 但它是**下界**：夹具是纯噪声（JPEG 最难压的东西），而真实 pixiv 插画平滑区域多得多。
+  //    2026-10-08 在服务器上对 5 张真实作品实测：1288→88KB、2044→80KB、904→140KB、
+  //    4548→236KB、24632→124KB（均值 ~134KB/页 ⇒ 4MB 约 30 页），而噪声夹具只有 ~851KB/页。
+  //    别拿这一行的数字去调 maxPages，要按**线上日志里真实的「降采样：XKB → YKB」**调。
+  console.log(`    [实测·下界] 原图 ${Math.round(big.bytes / 1024)}KB/页 → 缩后 ${Math.round(pageCost / 1024)}KB/页；`
     + `本用例预算 ${Math.round(budget / 1024)}KB 装下 ${PAGES} 页；`
-    + `同样比例下 **4MB 卡片约能装 ${Math.floor(internals.DEFAULTS.forwardBudgetBytes / pageCost)} 页**`);
+    + `同比例下 4MB 约 ${Math.floor(internals.DEFAULTS.forwardBudgetBytes / pageCost)} 页`
+    + `（噪声夹具≈最难压；真实插画实测均值约 134KB/页 ⇒ 约 30 页）`);
 }, NEED_FFMPEG);
 
 check('降采样（真压缩）：走逐张发那条路时，发的也是**缩小的**那个文件', async () => {
