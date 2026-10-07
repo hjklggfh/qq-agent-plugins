@@ -1927,11 +1927,36 @@ check('降采样（真压缩）：缩完的页能全收进**一条卡片**，且
   const paged = asked.filter((one) => one.includes(`_p`));
   const downsized = [...sink.all().matchAll(/降采样：(\d+)KB → (\d+)KB/g)]
     .map((m) => ({ from: Number(m[1]), to: Number(m[2]) }));
-  assert.equal(paged.length, PAGES + 1,
-    `应该取了 5 页 + 探测第 6 页，实际请求 ${paged.length} 次`);
-  // 每一页都必须真的被缩过（阈值调到 512KB，而每页都远大于它）
-  assert.equal(downsized.length, PAGES,
-    `每一页都该留下一条"降采样：XKB → YKB"，实际 ${downsized.length} 条：\n${sink.all()}`);
+
+  // ── 请求计数：按**页码去重**，不数总次数 ──────────────────────────────────
+  // ⚠️ 这里踩过两次，都别再写"正好 PAGES+1 次"：
+  //    ① **最后一页探测必然要试多个候选地址**：第 6 页 404 之后插件还会试尺寸档/模板
+  //       （本机用假子进程驱动实测 p5×3）。所以"5 页 + 1 次探测 = 6"这个算术从根上就不对
+  //       （真机那两次 4 次 / 8 次就是这么来的）。
+  //    ② 一页也可能因**候选回退**被取多次（图床抖动，见 README §7）。
+  //    真正的不变式只有：**该有的页都取到了、已取到的页没有被重复当成"新的一页"**。
+  const pageNoOf = (u) => Number(new RegExp(`_p(\\d+)_`).exec(u)?.[1] ?? -1);
+  const perPage = new Map();   // 页码 → 被请求次数
+  for (const one of paged) {
+    const no = pageNoOf(one);
+    perPage.set(no, (perPage.get(no) ?? 0) + 1);
+  }
+  const pageNos = [...perPage.keys()].sort((a, b) => a - b);
+  // 前 5 页每页都取过、且每页只取一次（重复取同一页 = 重复发同一张图，是要判红的缺陷）
+  assert.deepEqual(pageNos.filter((no) => no < PAGES), [0, 1, 2, 3, 4],
+    `前 ${PAGES} 页每页都该取到；实际取过：${pageNos.join(',')}`);
+  for (let no = 0; no < PAGES; no += 1) {
+    assert.equal(perPage.get(no), 1, `第 ${no + 1} 页只该被取一次（重复取 = 重复发图）`);
+  }
+  // 续页探测：第 6 页（不存在）必须被问过 —— 否则"续页在上限处停下"这件事没被验到。
+  // 不写"正好 1 次"：它 404 之后还要试别的候选地址（上面 ①）。
+  assert.ok(perPage.get(PAGES) >= 1,
+    `第 ${PAGES + 1} 页（不存在）该被探测过，实际请求过：${pageNos.join(',')}`);
+
+  // 每一页都必须真的被缩过（阈值调到 512KB，而每页都远大于它）。
+  // ⚠️ 用 `>=`：候选回退成功的那一次也会留下一条"降采样"日志。
+  assert.ok(downsized.length >= PAGES,
+    `每一页都该留下至少一条"降采样：XKB → YKB"（共 ${PAGES} 页），实际 ${downsized.length} 条：\n${sink.all()}`);
   assert.equal(forwards.length, 1, '5 页大图该打包成**一条**卡片');
   assert.equal(images.length, 0, '走卡片时不该再逐张发');
   const nodes = forwards[0].payload.nodes;
