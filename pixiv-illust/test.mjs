@@ -67,7 +67,8 @@ const {
   ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
   imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal, pageUrlsOf, parseSuffixPath,
   // 降采样：这几个是**导出**的（不是只挂在 internals 上），因为用例要直接驱动它们
-  resolveFfmpeg, buildDownsampleArgs, downsampleToJpeg, __resetFfmpegProbe, __setSpawnForTest
+  resolveFfmpeg, buildDownsampleArgs, downsampleToJpeg, __resetFfmpegProbe, __setSpawnForTest,
+  __setLogSinkForTest, __setSettingsForTest
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
@@ -345,9 +346,23 @@ function fakeHostCtx(overrides = {}) {
   return { ctx, images, forwards, sends, emitted, session };
 }
 
-function makeToolCtx(hostCtx) {
+/**
+ * 假 logger：把插件的四行日志收进数组，供用例断言"日志里说的是真正生效的值"。
+ * 形状照 `plugins/_host/context.js` 的 `pluginLogger`（宿主会加 `[plugin:<id>]` 前缀，这里不模拟）。
+ */
+function fakeLogger() {
+  const lines = [];
+  const push = (level) => (...args) => { lines.push(`${level}:${args.map((a) => String(a)).join(' ')}`); };
+  return {
+    lines,
+    all: () => lines.join('\n'),
+    logger: { debug: push('debug'), info: push('info'), warn: push('warn'), error: push('error') }
+  };
+}
+
+function makeToolCtx(hostCtx, log = null, config = CONFIG) {
   return buildPluginToolContext({
-    manifest, hostCtx, config: CONFIG, dataDir, log: null, signal: null
+    manifest, hostCtx, config, dataDir, log, signal: null
   });
 }
 
@@ -1095,6 +1110,120 @@ check('给 pid 那条路：用 `-2`/`-3` 续页并打包成一条卡片，且**�
   assert.equal(forwards.length, 1, '两页 → 打包成一条「聊天记录」');
   assert.equal(images.length, 0);
   assert.equal(forwards[0].payload.nodes.length, 3, '说明 + 两张图');
+});
+
+check('续页预算：日志里必须打**真正生效的那个**预算值（不是写死的 12MB）', async () => {
+  // 现场教训（2026-10-08，服务器日志）：预算是可配的（现场配的 4MB），而这条收手日志
+  // 写死成"（合并转发上限 12MB）" → 一边说"已 10MB"一边说"上限 12MB"，
+  // 跟"生效设置：… 卡片预算=4.0MB"那行**自相矛盾**，排查时被带偏过。
+  internals.__setState([], []);
+  const pid = '77700001';
+  const pageBase = 'https://i.pixiv.re/img-master/img/2024/04/04/04/04/04';
+  const { ctx, forwards } = fakeHostCtx();
+  const sink = fakeLogger();
+  const budget = 1536 * 1024;   // 1.5MB：故意取一个**不等于默认值**的数，写死就必然对不上
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);
+
+  // ⚠️ 插件日志走的是**激活时绑定的** api.log，生效设置读的也是**激活时绑定的** api.config
+  //    （不是 toolCtx 上的那份）—— 所以两样都得用测试缝注入，否则这条用例会静默地
+  //    跑在默认值上（第一次就是这么踩的：注入的 1.5MB 根本没生效，4 页全收了）。
+  __setLogSinkForTest((level, message) => sink.lines.push(`${level}:${message}`));
+  __setSettingsForTest({ maxCount: 1, maxPages: 10, forwardBudgetBytes: budget });
+  try {
+    await withFetch(
+      async (url) => {
+        const u = String(url);
+        if (u.includes('/setu/v2')) {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+            async json() {
+              return {
+                data: [{
+                  pid: Number(pid), p: 0, title: '大图多页', author: '作者', r18: false,
+                  tags: ['测试'], ext: 'jpg', urls: { regular: `${pageBase}/${pid}_p0_master1200.jpg` }
+                }]
+              };
+            }
+          };
+        }
+        // 每页 900KB：默认 4MB 预算下装得下 4 页（不会收手），1.5MB 预算下第 2 页就该收手
+        if (/_p\d+_/.test(u)) {
+          return fakeImageResponse({ contentLength: 900 * 1024, body: chunkStream([new Uint8Array(900 * 1024)]) });
+        }
+        return fakeImageResponse({ status: 404 });
+      },
+      () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+    );
+  } finally {
+    __setLogSinkForTest(null);
+    __setSettingsForTest(null);
+  }
+
+  const text = sink.all();
+  // 预算按**一位小数**打（1.5MB 被四舍五入成"2MB"就是在骗人）
+  assert.match(text, /预算 1\.5MB/,
+    `收手日志必须打实际生效的预算（1.5MB），实际日志：\n${text}`);
+  assert.doesNotMatch(text, /12MB/,
+    `绝不能再出现写死的 12MB —— 它与"生效设置"那行自相矛盾。实际日志：\n${text}`);
+  // 收手确实发生了（不然上面那条可能是在空跑）
+  assert.match(text, /就发前 1 页/,
+    `首页 900KB、预算 1.5MB 时，第 2 页（会到 1.8MB）就该被拦下。实际日志：\n${text}`);
+  assert.equal(forwards.length, 0, '只发了 1 页时不套卡片（走逐张发那条路）');
+});
+
+check('续页预算：首页自己就顶过预算时，也要明确说一句（不许一声不响只发一页）', async () => {
+  // 边界：把预算配得比单页还小（或首页特别大）时，续页循环的第一条判据就直接 break ——
+  // 原来**什么日志都不打**，于是"只发了一页"看起来像正常（没有续页机会），
+  // 而不是"被预算拦了"。用户要查"为什么只有一页"时完全没有线索。
+  internals.__setState([], []);
+  const pid = '77700002';
+  const pageBase = 'https://i.pixiv.re/img-master/img/2024/04/05/04/04/04';
+  const { ctx, forwards } = fakeHostCtx();
+  const sink = fakeLogger();
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);
+
+  __setLogSinkForTest((level, message) => sink.lines.push(`${level}:${message}`));
+  __setSettingsForTest({ maxCount: 1, maxPages: 10, forwardBudgetBytes: 512 * 1024 });   // 0.5MB
+  try {
+    await withFetch(
+      async (url) => {
+        const u = String(url);
+        if (u.includes('/setu/v2')) {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+            async json() {
+              return {
+                data: [{
+                  pid: Number(pid), p: 0, title: '超大首页', author: '作者', r18: false,
+                  tags: ['测试'], ext: 'jpg', urls: { regular: `${pageBase}/${pid}_p0_master1200.jpg` }
+                }]
+              };
+            }
+          };
+        }
+        // 单页 2MB，已经是 0.5MB 预算的 4 倍
+        if (/_p\d+_/.test(u)) {
+          return fakeImageResponse({ contentLength: 2 * 1024 * 1024, body: chunkStream([new Uint8Array(2 * 1024 * 1024)]) });
+        }
+        return fakeImageResponse({ status: 404 });
+      },
+      () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+    );
+  } finally {
+    __setLogSinkForTest(null);
+    __setSettingsForTest(null);
+  }
+
+  const text = sink.all();
+  assert.match(text, /图片合计已 2\.0MB（卡片预算 0\.5MB），不再续页/,
+    `首页就超预算时必须明确说是预算拦的，实际日志：\n${text}`);
+  assert.equal(forwards.length, 0, '只有一页 → 不套卡片');
 });
 
 check('单图作品：就算有转发能力也**不要**套一层卡片（一张图不值得）', async () => {

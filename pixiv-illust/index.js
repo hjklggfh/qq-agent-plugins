@@ -231,12 +231,26 @@ const MIME_EXT = {
   'image/webp': '.webp', 'image/gif': '.gif', 'image/avif': '.avif'
 };
 
+/**
+ * 设置注入（仅测试用）。**存在的理由**：`settings()` 读的是**激活时绑定的 `api.config`**，
+ * 而 `buildPluginToolContext({ config })` 收到的是另一份、且只喂给 `secrets` 那条路 ——
+ * 用例给 toolCtx 注入 config 是**改不动生效设置**的，于是"预算/阈值可配"这类断言会静默地
+ * 跑在默认值上（写"日志必须打生效预算"那条用例时才发现的）。
+ */
+let settingsOverride = null;
+/** 测试用：覆盖生效设置（传 null 恢复读 api.config）。 */
+export function __setSettingsForTest(override) {
+  settingsOverride = (override && typeof override === 'object') ? override : null;
+}
+
 function settings() {
   // 移植接口差异：原宿主是 `api.config()`（函数，每次现读）；本项目 `api.config` 是
   // **非凭据快照**（plugins/_host/context.js 的 buildPluginApi 在 activate 前读一次），
   // 所以这里的语义是"进程启动时的那份设置"。改设置要重启才生效 —— 与宿主控制台
   // "启停/确认/改设置都只写配置并回 restartRequired"的口径一致（docs/PLUGINS.md §12.3）。
-  const raw = (api && api.config && typeof api.config === 'object' ? api.config : null) || {};
+  const raw = settingsOverride
+    || (api && api.config && typeof api.config === 'object' ? api.config : null)
+    || {};
   const out = { ...DEFAULTS };
   for (const [k, v] of Object.entries(raw)) {
     if (v !== undefined && v !== null) out[k] = v;
@@ -1461,8 +1475,21 @@ async function sizeUrlsFromTemplate(templateUrl, s, pid = '') {
 
 /** 记一行 info 日志；日志本身失败绝不能影响取图，所以统一吞掉异常。 */
 function say(message) {
+  // 测试缝：让用例能断言"日志里说的是不是真正生效的值"（见 __setLogSinkForTest）。
+  // 生产里 sink 恒为 null，走的还是宿主 logger —— 行为一字未变。
+  if (logSink) { try { logSink('info', message); } catch { /* 同上 */ } return; }
   try { api?.log?.info?.(message); } catch { /* 日志失败不影响主流程 */ }
 }
+
+/**
+ * 日志出口（仅测试用）。**存在的理由**：`say()` 走的是**激活时**绑定的 `api.log`，
+ * 而 `toolCtx.log` 是另一份（`buildPluginToolContext` 现拼的）—— 用例给 toolCtx 注入
+ * 假 logger 是收不到插件日志的，于是"日志文案"这类断言会**静默空跑**（第一次就这么踩了）。
+ * 传 null 恢复。
+ */
+let logSink = null;
+/** 测试用：换掉插件日志出口（传 null 恢复走 api.log）。 */
+export function __setLogSinkForTest(fn) { logSink = typeof fn === 'function' ? fn : null; }
 
 // ── 降采样：> 阈值的大图缩成"最长边 N px 的 JPEG" ─────────────────────────
 //
@@ -1912,16 +1939,27 @@ export async function activate(hostApi) {
             //        转发会被门面拒掉、再回落逐张发，只会更慢 ✗。
             const startedAt = Date.now();
             const pageBudgetMs = Math.max(5000, Number(s.pageBudgetMs) || 40000);
-            const forwardBudgetBytes = Math.max(0, Number(s.forwardBudgetBytes) || 10 * 1024 * 1024);
+            const forwardBudgetBytes = Math.max(0, Number(s.forwardBudgetBytes) || DEFAULTS.forwardBudgetBytes);
             let collectedBytes = Number(got.bytes) || 0;
-            for (let page = 1; page < maxPages; page += 1) {
+            /**
+             * 收手日志 —— **必须打真正生效的那个预算值**。
+             * ⚠️ 这里以前写死成"（合并转发上限 12MB）"，而预算是**可配的**（现场配的是 4MB），
+             *    于是日志一边说"已 10MB"一边说"上限 12MB"，与"生效设置：… 卡片预算=4.0MB"
+             *    那行自相矛盾，排查时被带偏过。抽成函数是为了两处判据共用同一句话
+             *    （有用例钉住："日志里出现的预算必须等于配置值"）。
+             * ⚠️ 用**一位小数**而不是 Math.round：预算是人配的，1.5MB 这种值被显示成"2MB"
+             *    就是在骗人（写这条用例时踩到：断言拿舍入值去比，实际配置 1.5MB 显示成 2MB）。
+             */
+            const mb = (n) => (Number(n) / 1048576).toFixed(1);
+            const sayBudgetStop = () => say(`[pixiv-illust] ${it.pid} 图片合计已 ${mb(collectedBytes)}MB`
+              + `（卡片预算 ${mb(forwardBudgetBytes)}MB），不再续页`);
+            // ⚠️ 循环**之前**也要判一次：第一页自己就顶过预算时（把 forwardBudgetBytes 调小、
+            //    或首页特别大），原来会走到循环里、第一条判据就 break —— 于是**一声不响**地
+            //    只发一页，日志里看不出是预算拦的（写这条用例时才发现的边界）。
+            if (collectedBytes > forwardBudgetBytes) sayBudgetStop();
+            for (let page = 1; page < maxPages && collectedBytes <= forwardBudgetBytes; page += 1) {
               if (Date.now() - startedAt > pageBudgetMs) {
                 say(`[pixiv-illust] ${it.pid} 时间预算用完（已取 ${extraPages.length + 1} 页），不再续页`);
-                break;
-              }
-              if (collectedBytes > forwardBudgetBytes) {
-                say(`[pixiv-illust] ${it.pid} 图片合计已 ${Math.round(collectedBytes / 1048576)}MB`
-                  + '（合并转发上限 12MB），不再续页');
                 break;
               }
               const pageUrls = pageUrlsOf(it, page, s.imageSize);
@@ -1930,12 +1968,12 @@ export async function activate(hostApi) {
                 const more = await fetchImage({ ...it, imageUrl: '', imageUrls: pageUrls }, s, { allowTemplate: false });
                 // 加进去**之前**先算：这一页会不会把合计顶过预算。
                 // （原先是"取下一页之前判"——那样最多会多收一页，而多收的那页正是把发送
-                //  拖过 60 秒、或者把卡片顶过 12MB 门线的原因 ✗。判据必须落在"收之前"。）
+                //  拖过 60 秒、或者把卡片顶过预算门线的原因 ✗。判据必须落在"收之前"。）
                 const pageBytes = Number(more.bytes) || 0;
                 if (collectedBytes + pageBytes > forwardBudgetBytes) {
                   say(`[pixiv-illust] ${it.pid} 再加第 ${page + 1} 页会到 `
-                    + `${Math.round((collectedBytes + pageBytes) / 1048576)}MB（预算 `
-                    + `${Math.round(forwardBudgetBytes / 1048576)}MB），就发前 ${extraPages.length + 1} 页`);
+                    + `${mb(collectedBytes + pageBytes)}MB（预算 ${mb(forwardBudgetBytes)}MB）`
+                    + `，就发前 ${extraPages.length + 1} 页`);
                   break;
                 }
                 extraPages.push({ file: more.file, page });
@@ -2159,7 +2197,8 @@ export const internals = {
   // ── 降采样（2026-10-08 第四轮）──────────────────────────────────────────
   // 查"为什么卡片只装了 3 页"时，这几个是唯一能单独跑一遍的入口。
   resolveFfmpeg, buildDownsampleArgs, downsampleToJpeg,
-  __resetFfmpegProbe, __setSpawnForTest,  // ── 状态目录（移植新增）────────────────────────────────────────────────
+  __resetFfmpegProbe, __setSpawnForTest, __setLogSinkForTest, __setSettingsForTest,
+  // ── 状态目录（移植新增）────────────────────────────────────────────────
   // 原来这里是 `__chatRatingsFile: CHAT_RATINGS_FILE`（模块常量）。现在两个路径都由
   // setStateDir() 现算，所以改成函数与 setter —— 测试要在自己的临时目录上跑，
   // 直接调 __setStateDir(tmp) 即可（不用碰真实数据目录）。
