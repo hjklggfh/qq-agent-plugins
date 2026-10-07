@@ -920,13 +920,14 @@ check('装载器全流程：带审批 initPlugins → loaded，注入的工具�
 // 查下来是协议端对 HTTP 请求体有 **2MB** 硬上限（实测 1.5MB 正常、2MB 起直接断连，
 // 报 UND_ERR_SOCKET），而图片是 base64 进 JSON body 的（膨胀 1.37 倍）。
 
-check('maxImageBytes 默认值：由协议端 2MB 请求体上限 ÷ base64 膨胀算出来', () => {
-  assert.equal(internals.DEFAULTS.maxImageBytes, 1363148);
-  // 这条断言就是那个换算：base64 之后**必须**还在 2MB 以内，否则必然被协议端掐断
-  assert.ok(internals.DEFAULTS.maxImageBytes * 1.37 < 2 * 1024 * 1024,
-    '1.37 倍膨胀后必须低于 2MB');
-  // 默认尺寸档远低于它，所以正常情况下根本不会碰到这条上限
+check('maxImageBytes 默认值：不再压着（宿主已把大 body 改走 WS，那条路不再怕大图）', () => {
+  assert.equal(internals.DEFAULTS.maxImageBytes, 5 * 1024 * 1024);
   assert.ok(internals.DEFAULTS.maxImageBytes > 1024 * 1024, '别小到把正常的 regular 也拦掉');
+  // 这个值曾被压到 1.3MiB —— 那是"协议端 HTTP 请求体 2MiB 上限"逼出来的临时对策。
+  // 宿主把超过 1.5MiB 的调用改走 WebSocket 之后，大图能发了，就不该再压着：
+  // 压着只会让 3.6MB 那种原图被无谓拒掉。留个下限防止以后又被谁压回去。
+  assert.ok(internals.DEFAULTS.maxImageBytes >= 4 * 1024 * 1024,
+    '宿主已支持大 body（WS 通道），别再压到几 MB 以下');
 });
 
 check('parseOriginalPath / sizeUrlsFromOriginal：拼出来的与接口给过的形状逐字节相同', () => {

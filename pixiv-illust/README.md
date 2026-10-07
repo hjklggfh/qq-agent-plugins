@@ -126,7 +126,7 @@ systemctl --user restart qq-agent-linux.service
 | `deadTtlDays` | number | `7` | 取不到的作品拉黑天数 | 默认 7 天。取图 404 的作品会被拉黑，避免同一个关键词每次都挑到同一张死图；到期自动放行（作品可能只是临时受限）。网络类失败（超时）不会被拉黑。 |
 | `timeoutMs` | number | `15000` | 单次请求超时（毫秒） | 国内走代理时可能需要调大。⚠️ 旧 manifest 里这条的 description 写「默认 20000」，而两边的实际默认值都是 **15000**（代码里的 `DEFAULTS.timeoutMs` 与旧 manifest 的 `settings.timeoutMs` 一致），以 15000 为准。**这个时限覆盖到"读完响应体"**，不只是等响应头（2026-10-08 修的，见第 7 节最后三行）。 |
 | `imageSize` | enum：`original`/`regular`/`small`/`thumb`/`mini` | `regular` | 取图的尺寸档 | **默认不是 `original`，这是 2026-10-08 用真实故障换来的**：接口默认只给 original，而那可能是 **12.5MB**；某些网络（实测阿里云一台国内实例）到 Cloudflare 的链路**搬不动这么大的文件** —— 小请求（搜索接口）1 秒就回，12.5MB 传到一半被重置，报 `fetch failed`。同一个作品换档后：`regular` ≈ 几百 KB、**`small` 只有 39KB**、`thumb` 19KB、`mini` 4KB。取图时会**自动往更小的档回退**（`regular` 传不完就试 `small`、再 `thumb`），所以除非你的网络很好，不建议改成 `original`。 |
-| `maxImageBytes` | number | `1363148`（1.3MiB） | 单张图片体积上限 | 超过就**不下载**，直接换下一个候选地址（有 `Content-Length` 就先看大小、一个字节都不下；没有就边读边算、越界即中止）。**这个值是量出来的，不是拍的**：图片最终是 base64 塞进 JSON body POST 给协议端的，而协议端对请求体有 **2MB** 硬上限（实测 1.5MB 正常、2MB 起直接断连，报 `fetch failed`/`UND_ERR_SOCKET`）；base64 膨胀 1.37 倍 ⇒ 图片上限约 2MB÷1.37，再留 10% 余量。**为什么要这条**：曾经一张 3.6MB 的图下下来了、发送时却只报一句 `fetch failed`，毫无线索；有了它会在下载阶段就拒掉并说清"多大、上限多少"。 |
+| `maxImageBytes` | number | `5242880`（5MB） | 单张图片体积上限 | 超过就**不下载**，直接换下一个候选地址（有 `Content-Length` 就先看大小、一个字节都不下；没有就边读边算、越界即中止）。**它已经不再是"能不能发出去"的边界**：协议端的 HTTP 端点对请求体有 ≈2MiB 硬上限（实测 1.5MB 正常、2MB 起断连），但宿主已把超过 1.5MiB 的调用自动改走 WebSocket 通道（`src/onebot/onebot.js` 的 `HTTP_BODY_SAFE_MAX`），多大都送得出去。所以这里留 5MB 只是因为"给群里发一张 12MB 的图"本身不礼貌；想要原图尽管调大。**注意**：这个值曾被压到 1.3MiB，那是传输层还搬不动大图时的临时对策，已随宿主修复撤掉。 |
 
 ### 按会话的分级覆盖
 
