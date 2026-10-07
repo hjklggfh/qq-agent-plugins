@@ -105,7 +105,21 @@ done
 echo "==> ③ 生效还需要两步（控制台里）：对新增/改过能力/工具的点「确认这份能力」，然后重启"
 echo "==> ④ 重启 $SERVICE"
 systemctl --user restart "$SERVICE"
-sleep 3
-echo "==> ⑤ /healthz"
-curl -s "http://127.0.0.1:${PORT}/healthz" || true
-echo
+
+# ⚠️ 别用固定的 sleep：控制台是在启动**约 10 秒后**才就绪的（先加载插件、再开 sqlite、最后 listen）。
+# 固定 sleep 3 会让这一步看起来像"服务没起来"，白排查一轮（2026-10-08 踩过）。
+echo "==> ⑤ 等控制台就绪（最多 40 秒）"
+ready=0
+for i in $(seq 1 40); do
+  if body="$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null)"; then
+    echo "    $body"
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" = 0 ]; then
+  echo "    40 秒内 /healthz 没有应答 —— 用这两条看服务："
+  echo "      bash /mnt/data/qq-agent/app/manage.sh status"
+  echo "      bash /mnt/data/qq-agent/app/manage.sh logs | tail -30"
+fi
