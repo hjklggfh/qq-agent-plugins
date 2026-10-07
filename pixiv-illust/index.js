@@ -1271,10 +1271,10 @@ async function downloadToTemp(url, timeoutMs, maxBytes) {
 }
 
 /**
- * 取一张作品的图：先试后端给的原图地址，不行再试 PID 模板。
+ * 取一张作品的图：先按尺寸档试图床给的地址（从大到小），最后才落到 PID 模板。
  *
  * 404（作品没了）**换下一个地址**试；超时/太大这类"这个地址不可用"也换下一个地址试
- * （见 isHardNetError 的说明：另一候选往往在另一个域名上，而且是压缩过的）。
+ * （见 isHardNetError 的说明：大图传不完就换更小的档，而不是放弃整张）。
  * 只有硬失败（DNS 不了 / 连接被拒）才放弃整张 —— 那时换域名也一样连不上，白等一个超时没意义。
  */
 async function fetchImage(item, s) {
@@ -1282,7 +1282,14 @@ async function fetchImage(item, s) {
   let last = null;
   for (let i = 0; i < urls.length; i += 1) {
     try {
-      return await downloadToTemp(urls[i], s.timeoutMs, s.maxImageBytes);
+      const got = await downloadToTemp(urls[i], s.timeoutMs, s.maxImageBytes);
+      // 成功时也报一行：调 imageSize 时最想知道的就是"实际下的是哪一档、多少字节"。
+      // 之前成功路径完全静默，查那个 12.5MB 故障时只能从失败里反推（2026-10-08 的教训）。
+      try {
+        api?.log?.info?.(`[pixiv-illust] 取图成功：${Math.round(got.bytes / 1024)}KB`
+          + `（第 ${i + 1}/${urls.length} 个候选，档位 ${s.imageSize}）`);
+      } catch { /* 日志失败不影响取图 */ }
+      return got;
     } catch (error) {
       last = error;
       if (error?.hardNetError) break;
