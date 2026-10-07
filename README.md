@@ -16,12 +16,21 @@
 ├── README.md                 ← 不会被当成插件（装载器只认子目录里有 plugin.json 的）
 ├── .gitignore
 ├── sync-plugins.sh           ← 服务器上跑它 = git pull + 重启
-└── my-first-plugin/          ← 一个插件 = 一个目录
-    ├── plugin.json           ← 目录名必须等于这里的 id
+├── my-first-plugin/          ← 一个插件 = 一个目录
+│   ├── plugin.json           ← 目录名必须等于这里的 id
+│   ├── index.js
+│   ├── test.mjs
+│   └── README.md
+└── pixiv-illust/             ← 从主仓库搬过来的（2026-10-08）：它需要按网络实际情况反复调，
+    ├── plugin.json             住在这里之后改它就是 git push + sync-plugins.sh，不用再发版本
     ├── index.js
     ├── test.mjs
     └── README.md
 ```
+
+`pixiv-illust` 有一条它自己的注意事项：**只有配了 `proxyUrl` 才会用到 `undici`**，
+而自建根**拿不到主程序的依赖** —— 配代理前要先在这个插件目录里 `npm i undici`
+（详见它的 README 第 9 节）。不配代理时完全不受影响。
 
 **目录名必须等于 `plugin.json` 里的 `id`**（不一致会被直接拒绝）。id 只能是小写字母、
 数字、连字符，以字母开头，2~39 位。
