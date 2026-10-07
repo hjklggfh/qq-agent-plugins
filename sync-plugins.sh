@@ -1,44 +1,100 @@
 #!/usr/bin/env bash
-# 在服务器上跑：把这个仓库的插件同步到线上并重启服务。
+# 在服务器上跑：把插件同步到线上并重启服务。
 #
 #   cd /mnt/data/qq-agent/plugins && bash sync-plugins.sh
 #
-# 它做四件事：只快进地拉一次 → 列出将要生效的插件 → 重启服务 → 打一次 /healthz。
-# ⚠️ 会重启服务：正在进行的一轮对话会被打断，OneBot 约 3 秒后重连。
+# 两条通道，与主程序更新器同一套思路（docs/AUTO_UPDATE.md 的"第二条下载通道"）：
+#   ① 先试 git（快，而且能看出改了什么）；
+#   ② git 不通就改用 GitHub API + codeload 源码包。
 #
-# 环境变量（都可省）：
-#   QQ_AGENT_SERVICE  服务名，默认 qq-agent-linux
-#   QQ_AGENT_PORT     控制台端口，默认 3210
+# 为什么必须有第二条：这类网络（阿里云国内实例）到 github.com 的 git 通道经常是黑洞 ——
+# TCP 443 连上就卡、`ls-remote` 干等超时、或者 "Error in the HTTP2 framing layer"，
+# 而 api.github.com 与 codeload.github.com 是好的。主程序的更新器就是靠这条备用通道
+# 才能自动更新的，这里照抄同一套。
+#
+# 环境变量：
+#   QQ_AGENT_SERVICE       服务名，默认 qq-agent-linux
+#   QQ_AGENT_PORT          控制台端口，默认 3210
+#   QQ_AGENT_GITHUB_TOKEN  私有仓库的只读 PAT；留空则读同目录的 .github-token（已 gitignore）
+#   QQ_AGENT_CODELOAD      codeload 基地址（镜像用），默认 https://codeload.github.com
+#   QQ_AGENT_GITHUB_API    GitHub API 基地址（镜像用），默认 https://api.github.com
+#   GIT_HTTP11=0           设为 0 则不强制 git 走 HTTP/1.1（默认强制：可规避 HTTP/2 链路抖动）
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OWNER=hjklggfh
+REPO=qq-agent-plugins
+BRANCH=main
 SERVICE="${QQ_AGENT_SERVICE:-qq-agent-linux}"
 PORT="${QQ_AGENT_PORT:-3210}"
-cd "$DIR"
+API="${QQ_AGENT_GITHUB_API:-https://api.github.com}"
+CODELOAD="${QQ_AGENT_CODELOAD:-https://codeload.github.com}"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -d .git ]; then
-  printf '这不是一个 git 仓库（%s）。先在服务器上 clone 一次，或者直接用 scp 传目录。\n' "$DIR" >&2
-  exit 1
+TOKEN="${QQ_AGENT_GITHUB_TOKEN:-}"
+if [ -z "$TOKEN" ] && [ -f "$DIR/.github-token" ]; then
+  TOKEN="$(tr -d ' \r\n' < "$DIR/.github-token")"
 fi
 
-echo "==> git pull --ff-only"
-# --ff-only：服务器上若有本地改动/分叉，宁可报错也不悄悄合并 —— 插件代码不该出现"只有线上才有的版本"
-git pull --ff-only
+# 私有仓库要用 token；公开仓库留空即可（这条通道对两者都成立）
+curl_gh() {
+  if [ -n "$TOKEN" ]; then
+    curl -fsS -H "Authorization: Bearer $TOKEN" "$@"
+  else
+    curl -fsS "$@"
+  fi
+}
 
-echo "==> 本仓库里的插件："
+echo "==> ① 先试 git 通道"
+# 强制 HTTP/1.1：这台机器的实测失败模式之一就是 "Error in the HTTP2 framing layer"。
+# 主程序更新器里的「强制 Git HTTP/1.1」开关治的是同一件事。
+GIT_ARGS=()
+[ "${GIT_HTTP11:-1}" = "0" ] || GIT_ARGS=(-c http.version=HTTP/1.1)
+if [ -d "$DIR/.git" ] && git "${GIT_ARGS[@]}" -C "$DIR" pull --ff-only 2>/dev/null; then
+  echo "    git 通道可用"
+else
+  echo "    git 通道不通（或这不是 git 仓库），改用 GitHub API + codeload 源码包"
+  sha="$(curl_gh -H 'Accept: application/vnd.github+json' \
+    "$API/repos/$OWNER/$REPO/commits/$BRANCH" \
+    | sed -n 's/.*"sha" *: *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+  if [ -z "$sha" ]; then
+    echo "    拿不到 commit sha —— 私有仓库要填 token（.github-token 或 QQ_AGENT_GITHUB_TOKEN）" >&2
+    echo "    也可以先用 curl 看一眼 API 通不通：$API/repos/$OWNER/$REPO" >&2
+    exit 1
+  fi
+  echo "    sha=$sha"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  # 用 API 的 tarball 端点：它 302 到 codeload 并带上签名 URL，
+  # 所以 token 只发给 api.github.com，不会跟着跳到 codeload 那边去。
+  curl_gh -L --max-time 180 -o "$tmp/repo.tar.gz" "$API/repos/$OWNER/$REPO/tarball/$sha"
+  mkdir -p "$tmp/out"
+  tar -xzf "$tmp/repo.tar.gz" -C "$tmp/out" --strip-components=1
+  if command -v rsync >/dev/null 2>&1; then
+    # --delete：上一版里有、这一版已删掉的插件要跟着消失，否则它会被当成"还在"。
+    # 排除 .git 与 token 文件，其余按仓库内容为准。
+    rsync -a --delete --exclude '.git' --exclude '.github-token' "$tmp/out/" "$DIR/"
+    echo "    已同步（rsync --delete）"
+  else
+    ( cd "$tmp/out" && tar -cf - . ) | ( cd "$DIR" && tar -xf - )
+    echo "    已同步（没有 rsync：只覆盖，不会删除已移除的文件）"
+  fi
+fi
+
+echo "==> ② 本仓库里的插件："
 found=0
-for d in */; do
+for d in "$DIR"/*/; do
   [ -f "${d}plugin.json" ] || continue
   found=1
   id="$(basename "$d")"
-  printf '    %-28s %s\n' "$id" "$(grep -o '"version"[^,]*' "${d}plugin.json" | head -1 | tr -d ' "')"
+  version="$(sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' "${d}plugin.json" | head -1)"
+  printf '    %-24s %s\n' "$id" "$version"
 done
 [ "$found" = 1 ] || echo "    （一个都没有）"
 
-echo "==> 生效还需要两步（控制台里）：对新增/改过能力/工具的点「确认这份能力」，然后重启"
-echo "==> 重启 $SERVICE"
+echo "==> ③ 生效还需要两步（控制台里）：对新增/改过能力/工具的点「确认这份能力」，然后重启"
+echo "==> ④ 重启 $SERVICE"
 systemctl --user restart "$SERVICE"
 sleep 3
-echo "==> /healthz"
+echo "==> ⑤ /healthz"
 curl -s "http://127.0.0.1:${PORT}/healthz" || true
 echo
