@@ -1833,12 +1833,12 @@ check('降采样（真压缩）：大图缩成 JPEG，最长边 1200、体积明
   assert.equal(h % 2, 0, `高必须是偶数（mjpeg 要求），实际 ${h}`);
 }, NEED_FFMPEG);
 
-check('降采样（真压缩）：5 页大图缩完能全收进**一条卡片**、且预算按缩后的体积算', async () => {
+check('降采样（真压缩）：缩完的页能全收进**一条卡片**，且预算按缩后的体积算', async () => {
   const dir = mkTemp('qq-pixiv-ds-card-');
-  // 故意造小一点（1000x1000 噪声）：它是**纯噪声**，JPEG 几乎压不动，比真实插画难压得多。
-  // 用更大的图会让"缩完每页仍有 1MB+"，于是 4MB 只装得下 4 页 —— 量的就成了预算拦不拦，
-  // 而不是"缩完装得下几张"（这条用例第一次上真机就是这么红的）。
-  const big = await makeBigImage(dir, { size: 1000 });
+  // ⚠️ 边长必须 **> 1200**：否则 scale 的 min(1200,iw) 不缩，只是**等尺寸重编码**，
+  //    那种情况下"缩后"几乎不比原图小（真机实测 870KB → 705KB，只降 19%），
+  //    于是任何"必须明显变小"的断言都会红 —— 这条用例第一版就是这么连红两次的。
+  const big = await makeBigImage(dir, { size: 1600 });
   assert.ok(big, '造图失败');
   assert.ok(big.bytes > 800 * 1024,
     `这条用例要的是"原图大到该被缩"的现场，实际只有 ${big.bytes} 字节 —— 造图参数要调大`);
@@ -1867,8 +1867,6 @@ check('降采样（真压缩）：5 页大图缩完能全收进**一条卡片**�
   });
 
   // ── 第一遍：只把第 1 页**真的压缩一次**，量出"缩后一页多大" ──────────────
-  // 预算不写死，而是**量出来的**：这样这条用例在任何压缩率下都成立
-  // （纯噪声/真插画、替身/真 ffmpeg），量的是不变量而不是某个环境的巧合数字。
   internals.__setStateDir(mkTemp('qq-pixiv-ds-measure-'));
   __setSettingsForTest({ downsampleOverBytes: 512 * 1024 });
   let pageCost = 0;
@@ -1879,20 +1877,22 @@ check('降采样（真压缩）：5 页大图缩完能全收进**一条卡片**�
         { ...internals.DEFAULTS, timeoutMs: 3000 })
     );
     assert.equal(first.downsized, true, '原图超过 512KB 阈值，这一页必须被缩过');
-    // ⚠️ 这条是**承重**的：上面那句只断言"标记为缩过"，而这个新用例的预算是由 pageCost
-    //    **推导**出来的 —— 万一 pageCost 实际是**原图**体积（例如记账被改回原图），
-    //    预算会跟着变大、自己把自己救了，整个用例反而永远绿（在本机用变异验证抓到的空档）。
-    assert.ok(first.bytes < big.bytes / 2,
-      `量到的那一页必须真的比原图小：原图 ${big.bytes} → 量到 ${first.bytes}`);
+    // ★★ 这条是整条用例的**承重判据**：它同时钉住两件事 ——
+    //    ① 这一页确实被缩了（不是等尺寸重编码那种"没缩"）；
+    //    ② 走过的记账用的是**缩后**体积，不是原图体积。
+    //    下面那个预算是由 pageCost 推导的，所以②必须在这里判死：否则一旦记账改用原图体积，
+    //    pageCost 就是原图、预算跟着变大，用例会**自己把自己救了**（本机变异验证抓到的空档）。
+    // 阈值取 0.9 而不是 0.5：**具体压多少不该写进用例**（它取决于图与编码器 —— 真机实测过
+    // 一张图只降 19%），判据只该钉"变小了以及预算用的是这个变小后的值"。
+    assert.ok(first.bytes < big.bytes * 0.9,
+      `量到的那一页必须确实比原图小（这是"记账用缩后体积"的哨兵）：原图 ${big.bytes} → 量到 ${first.bytes}`);
     pageCost = first.bytes;
   } finally {
     __setSettingsForTest(null);
   }
-  // 预算取"刚好装得下 5 页、第 6 页必然超"：既证明 5 页装得进，也证明记账用的是缩后的体积——
-  // 若哪次改成按**原图**记账，第 1 页自己就会超预算（原图比这个预算大得多），立刻判红。
+  // 预算取"缩后的 5 页刚好装得下、且必然装不下第 6 页"：既证明缩过的页能全收进一条卡片，
+  // 也保证上面那条哨兵判的是**真的变小了**而不是"刚好卡在边界"。
   const budget = pageCost * PAGES + Math.floor(pageCost / 2);
-  assert.ok(big.bytes > budget,
-    `原图（${big.bytes}）必须大于这个预算（${budget}），否则"记账用原图"这个变异就测不出来`);
 
   // ── 第二遍：真跑一遍工具，5 页 + 探测第 6 页 ─────────────────────────────
   internals.__setState([], []);
@@ -1938,14 +1938,13 @@ check('降采样（真压缩）：5 页大图缩完能全收进**一条卡片**�
   assert.equal(nodes.length, PAGES + 1, '一条说明 + 5 张图 —— 预算刚好装得下 5 页');
   const total = nodes.filter((n) => n.data.content[0].type === 'image')
     .reduce((sum, n) => sum + Buffer.byteLength(n.data.content[0].data.file.replace('base64://', ''), 'base64'), 0);
-  assert.ok(total <= budget, `5 页合计（${total}）必须在预算（${budget}）之内`);
-  // 缩过的合计要明显小于原图之和 —— 与上面"刚好装下 5 页"合起来才说明
-  // **记账用的是缩后的体积**（变异：换回原图体积 → 第 1 页就超预算、nodes 变 2，判红）
-  assert.ok(total < pageBytes.length * PAGES / 2,
-    `缩过的总字节要明显小于原图之和（原图 ${pageBytes.length}×${PAGES}，实际 ${total}）`);
+  assert.ok(total <= budget, `${PAGES} 页合计（${total}）必须在预算（${budget}）之内`);
+  // 卡片里的字节总和必须严格小于"原图总量" —— 这就是**缩过**的铁证（也再次钉住记账口径）。
+  assert.ok(total < pageBytes.length * PAGES,
+    `卡片里的合计必须小于原图之和（原图 ${pageBytes.length}×${PAGES}，实际 ${total}）`);
   // 把实测值打出来：**这个数就是"4MB 能装几页"的依据**，比任何说明都直接
-  console.log(`    [实测] 原图 ${Math.round(pageBytes.length / 1024)}KB/页 → 缩后 `
-    + `${Math.round(pageCost / 1024)}KB/页（本用例预算 ${Math.round(budget / 1024)}KB）；`
+  console.log(`    [实测] 原图 ${Math.round(big.bytes / 1024)}KB/页 → 缩后 ${Math.round(pageCost / 1024)}KB/页；`
+    + `本用例预算 ${Math.round(budget / 1024)}KB 装下 ${PAGES} 页；`
     + `同样比例下 **4MB 卡片约能装 ${Math.floor(internals.DEFAULTS.forwardBudgetBytes / pageCost)} 页**`);
 }, NEED_FFMPEG);
 
