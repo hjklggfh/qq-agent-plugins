@@ -147,6 +147,13 @@ const DEFAULTS = {
   // 默认 4（而不是 1）：用户要的就是"多图作品的图"。上限存在的意义是别让一个 20 页的作品
   // 把群聊刷屏、也别把 60 秒的工具预算耗光（每页 1~3 秒）。
   maxPages: 4,
+  // 续页的**时间预算**（毫秒）。工具的硬上限是 60 秒，而下载与最后那次发送共用它 ——
+  // 所以取图阶段先花掉 40 秒就收手，留 20 秒给发送。按"页数"限制是不够的：每页 1~3MB，
+  // maxPages=10 照样能顶穿 60 秒，然后工具被掐断、**什么都没发出去**（2026-10-08 实测）。
+  pageBudgetMs: 40000,
+  // 续页的**字节预算**：门面的合并转发上限是"图片合计 12MB"，这里更早收手（10MB）。
+  // 取多了没用 —— 转发会被门面拒掉，再回落逐张发只会更慢。
+  forwardBudgetBytes: 10 * 1024 * 1024,
   // 分级：多选（全年龄 / R18 / R18G），可选一个或多个、**至少一个**。
   // 只有勾上的档会发出来。旧字段 allowR18 仍保留在下面，只在配置里没有 ratings 时才读。
   ratings: ['safe'],
@@ -1648,12 +1655,34 @@ export async function activate(hostApi) {
             // ② 后页取不到**不影响**已经取到的第一页；③ 认不出日期路径就放弃续页。
             const maxPages = Math.max(1, Math.round(Number(s.maxPages) || 1));
             const extraPages = [];
+            // ⚠️ 光按"页数"限制**不够**（2026-10-08 线上实测踩到）：工具的硬上限是 **60 秒**，
+            //    而每页要下 1~3MB（这条线路上 1~5 秒/页），再叠上最后那次转发的体积 ——
+            //    `maxPages: 10` 很容易顶穿 60 秒，结果工具被宿主掐断、**什么都没发出去** ✗
+            //    （用户看到的正是"未合并成卡片 + 超过 60000ms 未返回"）。
+            //    所以这里按**时间**与**字节**双重设限，而不是只数页数：
+            //      · 时间：留 20 秒给最后的发送（下载与发送共用那 60 秒）；
+            //      · 字节：门面的合并转发上限是 12MB（图片合计），这里更早收手 —— 取多了也没用，
+            //        转发会被门面拒掉、再回落逐张发，只会更慢 ✗。
+            const startedAt = Date.now();
+            const pageBudgetMs = Math.max(5000, Number(s.pageBudgetMs) || 40000);
+            const forwardBudgetBytes = Math.max(0, Number(s.forwardBudgetBytes) || 10 * 1024 * 1024);
+            let collectedBytes = Number(got.bytes) || 0;
             for (let page = 1; page < maxPages; page += 1) {
+              if (Date.now() - startedAt > pageBudgetMs) {
+                say(`[pixiv-illust] ${it.pid} 时间预算用完（已取 ${extraPages.length + 1} 页），不再续页`);
+                break;
+              }
+              if (collectedBytes > forwardBudgetBytes) {
+                say(`[pixiv-illust] ${it.pid} 图片合计已 ${Math.round(collectedBytes / 1048576)}MB`
+                  + '（合并转发上限 12MB），不再续页');
+                break;
+              }
               const pageUrls = pageUrlsOf(it, page, s.imageSize);
               if (!pageUrls.length) break;
               try {
                 const more = await fetchImage({ ...it, imageUrl: '', imageUrls: pageUrls }, s, { allowTemplate: false });
                 extraPages.push({ file: more.file, page });
+                collectedBytes += Number(more.bytes) || 0;
               } catch (error) {
                 const status = Number(error?.status) || 0;
                 // 404/410 = 这个作品没有这一页 → 正常结束（不记日志，那是预期的边界）
@@ -1670,6 +1699,8 @@ export async function activate(hostApi) {
             //     群里只占一条卡片（这正是那个能力存在的理由）；
             //   · 否则（旧宿主没这个能力，或转发失败 —— 协议端不支持那个 action）→ **回落逐张发**，
             //     一张都不丢。这条回落是刻意的：能力缺失不该让功能变成"什么都发不出来"。
+            //     ⚠️ 但回落**也要看预算**：转发失败常常是"图太多/太大"，那不是"再逐张发一遍"能
+            //     解决的 ✗ —— 硬发下去只会把 60 秒顶穿，最后一张都发不出去 ✗。
             //
             // 移植接口差异：原来是 `ctx.sender.sendImage(ctx.chatKey, { file }, { note })`。
             // 本项目走门面：`{ path }`（必须落在插件状态目录里，见 tempDir 的注释）+ `{ label }`。
@@ -1695,8 +1726,15 @@ export async function activate(hostApi) {
             }
             if (!sentViaForward) {
               await toolCtx.sendImage({ path: got.file }, { label: note });
+              let sentExtra = 0;
               for (const one of extraPages) {
+                if (Date.now() - startedAt > pageBudgetMs + 10000) {
+                  say(`[pixiv-illust] ${it.pid} 时间预算用完，余下 `
+                    + `${extraPages.length - sentExtra} 页这次不发了（换个更小的 maxPages 会更稳）`);
+                  break;
+                }
                 await toolCtx.sendImage({ path: one.file }, { label: `${note}（第 ${one.page + 1} 页）` });
+                sentExtra += 1;
               }
             }
             // 只有真的发出去了才记账 —— 失败不记，否则一次网络抖动就把这张图永久跳过
