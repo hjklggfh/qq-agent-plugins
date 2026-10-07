@@ -1437,6 +1437,17 @@ export async function activate(hostApi) {
   setStateDir(dir);
   loadState();
   api.log?.info?.(`已激活：状态目录 ${dir}`);
+  // 把**生效的**设置打出来。这一行专门回答"为什么它还用着旧值"这类问题：
+  // 设置是启动时读的一次快照（见 settings() 的注释），所以从外面看，
+  // "改了设置没重启"与"设置根本没保存上"长得一模一样 —— 只能靠这一行区分。
+  // （2026-10-08：`maxImageBytes` 在设置里留着一个旧值，白查了一轮才知道是它。）
+  {
+    const s = settings();
+    const mb = (n) => `${(Number(n) / 1048576).toFixed(1)}MB`;
+    api.log?.info?.(`生效设置：imageSize=${s.imageSize} maxImageBytes=${mb(s.maxImageBytes)}`
+      + ` maxCount=${s.maxCount} timeoutMs=${s.timeoutMs} retryCandidates=${s.retryCandidates}`
+      + '（改这些要重启才生效）');
+  }
 
   api.registerTool({
     // 移植接口差异：原版是 registerTool({ id: 'pixiv_image', name: 'Pixiv 来张图',
