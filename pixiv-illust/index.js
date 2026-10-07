@@ -177,6 +177,18 @@ const DEFAULTS = {
   downsampleMaxEdge: 1200,
   /** JPEG 质量：ffmpeg 的 `-q:v`（2 最好、31 最差）。5 ≈ 300KB/1200px，肉眼够用。 */
   downsampleQuality: 5,
+  /**
+   * 单页取图**瞬时失败后重试几次**（默认 1，即每页最多试两次；设 0 关掉）。
+   *
+   * 为什么需要（2026-10-08 线上真实漏发）：这个图床会间歇性卡住 —— 同一个地址前两次 200、
+   * 第三次 20 秒没响应。而"贴链接/给 pid"那条路**每页只有 1 个候选**（没有尺寸档可退），
+   * 于是那一次卡住就让**后面所有页一页都没试**：一个 6+ 页的作品只发出了 2 页。
+   * 重试一次能对冲这种抖动；而 404（真的没有这一页）与体积超限**不重试**，所以不会把
+   * "作品就到这里了"误判成"再试一次"。
+   *
+   * 代价：每次重试最坏要花掉一整个 `timeoutMs`，所以上限夹在 2 次，且与 30 秒取图预算共享。
+   */
+  pageRetryOnce: 1,
   // 分级：多选（全年龄 / R18 / R18G），可选一个或多个、**至少一个**。
   // 只有勾上的档会发出来。旧字段 allowR18 仍保留在下面，只在配置里没有 ratings 时才读。
   ratings: ['safe'],
@@ -1101,6 +1113,35 @@ function isNetError(error) {
     .test(String(error?.message ?? error));
 }
 
+/** 等待（重试前的那点间隔，让图床喘口气）。 */
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, Math.max(0, Number(ms) || 0)); });
+
+/**
+ * "这个地址这次不行、但过一会儿可能行" —— 也就是**值得重试一次**的失败。
+ *
+ * 与 `hardNetError`（DNS 解析不了 / 连接被拒：换域名也一样连不上，重试纯属白等）相对。
+ * 超时、socket hang up、连接被重置、以及"响应头回来但体不回来"都属于这一类：
+ * 它们只说明**这一次**没成。2026-10-08 线上实测：同一个 `pixiv.re/150542157-3.png`
+ * 前两次 200、第三次 20 秒没响应 —— 而那个作品每页只有 1 个候选，一次卡住就让
+ * 后面所有页一页都没试（6+ 页的作品只发出 2 页）。
+ *
+ * 明确**不**重试的：404/410（真的没有这一页）、体积超限（tooBig，换页也没用）、
+ * 以及一切非网络类错误（配置/参数问题，重试不会变好）。
+ */
+export function isTransientFetchError(error) {
+  if (!error) return false;
+  if (error.hardNetError) return false;
+  if (error.tooBig) return false;
+  const status = Number(error.status) || 0;
+  // ⚠️ 这一行是**文档性**的：去掉它行为不变（下面的 `status >= 400` 照样拦住 404/410）。
+  //    留着是为了让"404/410 = 作品到此为止、不重试"这条决策在代码里一眼可见。
+  //    （变异验证实测：把它改成 `if (false)` 后**没有任何用例判红** —— 因为它确实不是承重的；
+  //     真正承重的是下一行，M10 变异打的就是下一行。）
+  if (status === 404 || status === 410) return false;
+  if (status >= 400) return false;          // 其他 HTTP 状态码不是"抖一下"
+  return error.netError === true || isNetError(error);
+}
+
 /**
  * 硬失败：换一个域名也一样连不上（DNS 解析不了 / 连接被拒 / 地址根本不合法）。
  *
@@ -1689,6 +1730,11 @@ export async function downsampleToJpeg(file, {
  * 404（作品没了）**换下一个地址**试；超时/太大这类"这个地址不可用"也换下一个地址试
  * （见 isHardNetError 的说明：大图传不完就换更小的档，而不是放弃整张）。
  * 只有硬失败（DNS 不了 / 连接被拒）才放弃整张 —— 那时换域名也一样连不上，白等一个超时没意义。
+ *
+ * **瞬时失败（超时/socket hang up）会重试一次**（见 shouldRetryOnce）：这个图床实测会间歇性
+ * 卡住 —— 同一个地址前两次 200、第三次 20 秒没响应。而"给 pid/链接"那条路每页**只有 1 个候选**，
+ * 于是那一次卡住就让**后面所有页一页都没试**（2026-10-08 线上真实漏发：一个 6+ 页的作品只发出 2 页）。
+ * 404 / 超限（太大）不重试：前者是"真的没有这一页"，后者换页也没用。
  */
 async function fetchImage(item, s, { allowTemplate = true } = {}) {
   // 「给 pid/链接」那条路只有模板一个候选（**完全没有图床给的地址**）→ 先用 301 推出尺寸版。
@@ -1710,17 +1756,29 @@ async function fetchImage(item, s, { allowTemplate = true } = {}) {
     }
   }
   const urls = imageCandidates({ ...item, imageUrls: itemUrls }, s.imageUrlTemplate, { allowTemplate });
+  // 重试次数取整并夹住：默认 1 次（即"每页最多试两次"），设 0 关掉。
+  // 上限 2 次是刻意的：每次都可能花掉一整个 timeoutMs，重试太多会把 30 秒取图预算吃光。
+  const retryOnce = Math.min(2, Math.max(0, Math.round(Number(s.pageRetryOnce) || 0)));
+  const retryDelayMs = 400;
   let last = null;
+  let hardFail = false;   // 硬失败（DNS/连接被拒）：**连候选都不用再试了**
   for (let i = 0; i < urls.length; i += 1) {
-    try {
-      const got = await downloadToTemp(urls[i], s.timeoutMs, s.maxImageBytes);
-      // 成功时也报一行：调 imageSize 时最想知道的就是"实际下的是哪一档、多少字节"。
-      // 之前成功路径完全静默，查那个 12.5MB 故障时只能从失败里反推（2026-10-08 的教训）。
-      // **必须带 pid**：不带的话多张作品混在一起就分不清哪个是哪张（又踩过一次）。
+    if (hardFail) break;
+    // attempts = 1（不重试）或 1 + retryOnce
+    for (let attempt = 0; attempt <= retryOnce; attempt += 1) {
+      // ⚠️ 硬失败要**在重试之前**判掉：DNS 解析不了 / 连接被拒时，同一个地址再试一次
+      //    必然同样失败，只会白等一个超时（有用例 `硬失败直接放弃整张` 盯着这个次数）。
+      // ⚠️ 这里只在 attempt>0 时生效；对**第一个 attempt** 由循环外那圈 hardFail 兜住。
+      if (attempt > 0 && hardFail) break;
       try {
-        api?.log?.info?.(`[pixiv-illust] 取图成功 ${item.pid}：${Math.round(got.bytes / 1024)}KB`
-          + `（第 ${i + 1}/${urls.length} 个候选，档位 ${s.imageSize}）`);
-      } catch { /* 日志失败不影响取图 */ }
+        const got = await downloadToTemp(urls[i], s.timeoutMs, s.maxImageBytes);
+        // 成功时也报一行：调 imageSize 时最想知道的就是"实际下的是哪一档、多少字节"。
+        // 之前成功路径完全静默，查那个 12.5MB 故障时只能从失败里反推（2026-10-08 的教训）。
+        // **必须带 pid**：不带的话多张作品混在一起就分不清哪个是哪张（又踩过一次）。
+        try {
+          api?.log?.info?.(`[pixiv-illust] 取图成功 ${item.pid}：${Math.round(got.bytes / 1024)}KB`
+            + `（第 ${i + 1}/${urls.length} 个候选${attempt ? `，瞬时失败后重试第 ${attempt} 次` : ''}，档位 ${s.imageSize}）`);
+        } catch { /* 日志失败不影响取图 */ }
       // ── 下完就地降采样（2026-10-08 第四轮）────────────────────────────────
       // ⚠️ 位置很要紧：必须在**返回之前**，因为调用方（多图续页）要用**最终体积**做预算。
       //    放在"发送之前"就晚了 —— 那时预算早就按原图算完，一页 1.4MB 只装得下 2~3 页。
@@ -1739,16 +1797,28 @@ async function fetchImage(item, s, { allowTemplate = true } = {}) {
         say(`[pixiv-illust] ${item.pid} 降采样跳过（${final.reason}），按原图 ${Math.round(final.bytes / 1024)}KB 继续`);
       }
       // 把**实际用到的地址**一并带出去：多图续页要靠它认出日期路径，而"给 pid/链接"那条路
-      // 的日期路径只存在于这里（它没有接口给的 imageUrl）——不带出去，那条路就永远只有第 1 页。
+      // 的日期路径只存在于这里（它没有 imageUrl）——不带出去，那条路就永远只有第 1 页。
       return { ...got, file: final.file, bytes: final.bytes, downsized: final.downsized, url: urls[i] };
     } catch (error) {
-      last = error;
-      if (error?.hardNetError) break;
-      // 换到下一个候选时说一声：这条日志是"图床在这个网络上部分不可用"的唯一现场证据，
-      // 没有它，用户看到的只是"取不到图"，而不知道插件已经退过一次了。
-      if (i + 1 < urls.length) {
-        const why = error?.tooBig ? error.message : String(error?.message ?? error).slice(0, 60);
-        try { api?.log?.info?.(`[pixiv-illust] 候选地址不可用（${why}），改试 PID 简写形式`); } catch { /* 日志失败不影响取图 */ }
+        last = error;
+        if (error?.hardNetError) { hardFail = true; break; }
+        // 瞬时失败（超时 / socket hang up / 连接被重置）→ **同一个地址重试一次**。
+        // 为什么值得：这条路上每页常常只有 1 个候选，那一次卡住就会让**后面所有页一页都没试**
+        //（2026-10-08 线上真实漏发：6+ 页的作品只发出 2 页）。而图床实测会间歇性卡住。
+        // 为什么不重试别的：404（真的没有这一页）与超限（太大）换页也一样，直接不试。
+        if (attempt < retryOnce && isTransientFetchError(error)) {
+          say(`[pixiv-illust] ${item.pid} 第 ${i + 1} 个候选瞬时失败（`
+            + `${String(error?.message ?? error).slice(0, 50)}），${retryDelayMs}ms 后重试一次`);
+          await sleep(retryDelayMs);
+          continue;
+        }
+        // 换到下一个候选时说一声：这条日志是"图床在这个网络上部分不可用"的唯一现场证据，
+        // 没有它，用户看到的只是"取不到图"，而不知道插件已经退过一次了。
+        if (i + 1 < urls.length) {
+          const why = error?.tooBig ? error.message : String(error?.message ?? error).slice(0, 60);
+          try { api?.log?.info?.(`[pixiv-illust] 候选地址不可用（${why}），改试 PID 简写形式`); } catch { /* 日志失败不影响取图 */ }
+        }
+        break;   // 这个地址不重试了，换下一个候选
       }
     }
   }

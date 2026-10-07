@@ -273,12 +273,17 @@ check('取图：第一候选是"软失败"（超时）时也要换下一个候�
     },
     () => internals.__fetchImage(item, { ...internals.DEFAULTS, timeoutMs: 3000 })
   );
-  assert.equal(calls.length, 2, `软失败也该试第二个候选，实际只试了 ${calls.length} 次`);
-  assert.ok(calls[1].endsWith('pixiv.re/116977943.png'));
+  assert.equal(calls.length, 3,
+    `软失败（超时）该"重试一次同一个候选、再换下一个候选"，实际只试了 ${calls.length} 次`);
+  // ⚠️ 前两次是**同一个**候选（第 1 页的地址）——瞬时失败重试（pageRetryOnce）的语义；
+  //    非硬失败**不跳候选**，所以同一个地址要真的试第二遍（有用例盯着硬失败不重试）。
+  assert.ok(calls[0].includes('i.pixiv.re') && calls[1].includes('i.pixiv.re'),
+    `前两次该是同一个候选（重试），实际：${calls.join(' , ')}`);
+  assert.ok(calls[2].endsWith('pixiv.re/116977943.png'));
   assert.equal(got.bytes, 4);
 });
 
-check('取图：硬失败（DNS 解析不了）直接放弃整张，不白等第二个候选', async () => {
+check('取图：硬失败（DNS 解析不了）直接放弃整张，不重试、也不换候选', async () => {
   internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-hard-')));
   const item = { pid: '1', imageUrl: 'https://i.pixiv.re/x_p0.png' };
   let calls = 0;
@@ -295,7 +300,10 @@ check('取图：硬失败（DNS 解析不了）直接放弃整张，不白等第
     }
   );
   assert.ok(error, '应该抛错');
-  assert.equal(calls, 1, 'ENOTFOUND 换域名也一样连不上，不该再试第二个候选');
+  // 两个"不该"：① 不该重试同一个地址（DNS 解析不了，再试也解析不了）
+  //            ② 不该换下一个候选（换域名也一样连不上）——这条原来由 `if (hardNetError) break`
+  //            在候选循环里保证，加了重试循环之后差点丢掉（本机插桩实测抓到，见 index.js 注释）
+  assert.equal(calls, 1, 'ENOTFOUND 既不该重试、也不该换候选 —— 只该试 1 次');
 });
 
 
@@ -1461,11 +1469,139 @@ check('给 pid 那条路：探测失败不计入熔断（否则三次取图就�
         } catch { /* 全失败是这条用例的预期 */ }
       }
     );
-    // HEAD 探测 + 模板取图各失败一次。只有后者该计数 → 1；HEAD 也计就是 2。
-    assert.equal(breakerState().streak, 1, '只该记模板那一次失败，探测性 HEAD 不算');
+    // 探测（quiet，不计数）+ 模板取图失败 **2 次**（第 1 次 + 瞬时失败重试 1 次，各计 1）
+    // → streak = 2。关键在这条用例的原意没变：**探测那次没有计数** —— 若探测也计，这里会是 3。
+    assert.equal(breakerState().streak, 2,
+      '只该记模板取图那两次（首次+重试），探测性 HEAD 不算；若探测也计会是 3');
   } finally {
     internals.__resetBreaker();
   }
+});
+
+check('取图：瞬时失败（超时）会重试一次同一个候选 —— 而不是直接放弃', async () => {
+  internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-retry-')));
+  const item = { pid: '116977943', imageUrl: 'https://i.pixiv.re/img-original/x_p0.png' };
+  let calls = 0;
+  const got = await withFetch(
+    async () => {
+      calls += 1;
+      if (calls === 1) {
+        // 图床间歇性卡住（2026-10-08 线上实测：同一地址前两次 200、第三次 20 秒没响应）
+        const e = new Error('fetch failed');
+        e.cause = { code: 'UND_ERR_HEADERS_TIMEOUT' };
+        throw e;
+      }
+      return fakeImageResponse({ contentLength: 4, body: chunkStream([new Uint8Array([1, 2, 3, 4])]) });
+    },
+    () => internals.__fetchImage(item, { ...internals.DEFAULTS, timeoutMs: 3000 })
+  );
+  assert.equal(calls, 2, `瞬时失败该重试一次（共 2 次），实际 ${calls} 次`);
+  assert.equal(got.bytes, 4, '重试成功后照常返回');
+});
+
+check('取图：404（真的没有这一页）不重试 —— 否则会把"作品到此为止"当成"再试试"', async () => {
+  internals.__setStateDir(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-pixiv-404-')));
+  const item = { pid: '116977943', imageUrl: 'https://i.pixiv.re/img-master/x_p3_master1200.jpg' };
+  let calls = 0;
+  const error = await withFetch(
+    // 干脆利落的 404 响应（生产里 downloadToTemp 会给这个错误赋 `status = 404`）
+    async () => { calls += 1; return fakeImageResponse({ status: 404 }); },
+    async () => {
+      try {
+        // allowTemplate:false —— 只试这一个地址，这样"请求次数"量的就是"有没有重试"
+        await internals.__fetchImage(item, { ...internals.DEFAULTS, timeoutMs: 3000 }, { allowTemplate: false });
+        return null;
+      } catch (e) { return e; }
+    }
+  );
+  assert.ok(error, '404 该抛错（调用方据此结束这个作品）');
+  assert.equal(calls, 1, `404 不该重试，实际请求 ${calls} 次`);
+});
+
+check('isTransientFetchError：只把"值得再试"的失败判成可重试', () => {
+  // 这条是**纯函数**用例，单独钉住分类口径 —— 特别是"带 404 状态的**网络类**错误"
+  // 这种最阴险的形态：CDN 在 404 上把连接断掉时，错误同时带 netError 与 status=404。
+  // ⚠️ 光靠上面那条端到端用例盖不住它：去掉 404 特判后，那条仍然绿（因为干脆的 404 响应
+  //    本来就不满足 isNetError）—— 变异验证实测的空跑，所以这里单独补一条。
+  const { isTransientFetchError } = plugin;
+  assert.equal(typeof isTransientFetchError, 'function', '这个分类函数该导出（用例要直接钉它）');
+  const mk = (over) => Object.assign(new Error(over.message || 'boom'), over);
+  // 可重试：超时 / 连接被重置 / socket hang up / 体不回来
+  assert.equal(isTransientFetchError(mk({ message: 'fetch failed', cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } })), true);
+  assert.equal(isTransientFetchError(mk({ message: 'socket hang up', netError: true })), true);
+  assert.equal(isTransientFetchError(mk({ message: 'This operation was aborted', netError: true })), true);
+  // 不可重试：硬失败（DNS/拒绝）、体积超限、404/410（带不带网络标记都不行）、其他 HTTP 状态
+  assert.equal(isTransientFetchError(mk({ message: 'fetch failed', netError: true, hardNetError: true })), false);
+  assert.equal(isTransientFetchError(mk({ message: '图片超过上限', tooBig: true })), false);
+  assert.equal(isTransientFetchError(mk({ message: '图片 HTTP 404：这张作品已经删了', netError: true, status: 404 })), false);
+  assert.equal(isTransientFetchError(mk({ message: '图片 HTTP 410', netError: true, status: 410 })), false);
+  assert.equal(isTransientFetchError(mk({ message: '图片 HTTP 500', netError: true, status: 500 })), false);
+  // 非网络错误（配置/参数问题）：不重试
+  assert.equal(isTransientFetchError(mk({ message: '内置搜索接口地址不合法' })), false);
+  assert.equal(isTransientFetchError(null), false);
+});
+
+check('多图作品：某一页**瞬时超时**时重试接着取，不许把后面几页全丢掉', async () => {
+  // ★ 线上真实漏发的回归用例（2026-10-08）：一个 6+ 页的作品只发出了 2 页。
+  //   现场：第 3 页 `请求超时：15 秒内没有任何响应（pixiv.re）`，而"贴链接/给 pid"那条路
+  //   **每页只有 1 个候选**，那一次卡住就让循环 break —— 第 4、5、6 页**一页都没试**。
+  //   修法：瞬时失败重试一次同一个候选（见 pageRetryOnce）。
+  internals.__setState([], []);
+  const pid = '94101307';
+  const base = 'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15';
+  const { ctx, forwards } = fakeHostCtx();
+  const sink = fakeLogger();
+  const toolCtx = makeToolCtx(ctx);
+  internals.__setStateDir(toolCtx.dir);
+  const tries = new Map();   // 页码 → 试过几次
+  __setLogSinkForTest((level, message) => sink.lines.push(`${level}:${message}`));
+
+  await withFetch(
+    async (url) => {
+      const u = String(url);
+      if (u.includes('/setu/v2')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+          async json() {
+            return {
+              data: [{
+                pid: Number(pid), p: 0, title: '多图作品', author: '作者', r18: false,
+                tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+              }]
+            };
+          }
+        };
+      }
+      const no = Number(new RegExp(`_p(\\d+)_`).exec(u)?.[1] ?? -1);
+      if (no >= 0 && no <= 1) {
+        const n = (tries.get(no) ?? 0) + 1;
+        tries.set(no, n);
+        // 第 2 页（p1）**第一次必超时**，第二次给图 —— 就是线上那个现场
+        if (no === 1 && n === 1) {
+          const e = new Error('fetch failed');
+          e.cause = { code: 'UND_ERR_HEADERS_TIMEOUT' };
+          throw e;
+        }
+        return fakeImageResponse({ contentLength: 1000, body: chunkStream([new Uint8Array(1000)]) });
+      }
+      return fakeImageResponse({ status: 404 });   // 第 3 页不存在 → 到这里为止
+    },
+    () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+  );
+
+  assert.equal(tries.get(1), 2, `第 2 页该被重试一次（首次超时 + 重试成功）；实际各页尝试次数：${JSON.stringify([...tries])}`);
+  assert.ok(tries.has(0) && tries.has(1),
+    `第 1、2 页都该取到；实际各页尝试次数：${JSON.stringify([...tries])}`);
+  const nodes = forwards[0]?.payload?.nodes ?? [];
+  assert.equal(nodes.length, 3,
+    `说明 + 两页图都要在卡片里（超时那页靠重试补回来）；实际 ${nodes.length} 个 node`);
+  // ★ 这条让本用例**承重**：重试日志只存在于"重试真的发生了"这条新路径上。
+  //   没有它，去掉重试的变异是由别的老用例判红的、这条回归用例反而是白搭（变异验证实测过）。
+  const text = sink.all();
+  assert.match(text, /瞬时失败（.*）.*后重试一次/,
+    `该留下一条"重试一次"的日志（这是线上漏发修复的现场证据），实际日志：\n${text}`);
 });
 
 // ── ④ 降采样（2026-10-08 第四轮：让 4MB 的卡片装得下 10+ 页）──────────────────
@@ -1680,7 +1816,8 @@ const downsample = (file, options = {}) => {
  * 返回一个"恢复原状"的函数 —— 用例的 finally 必须调它，否则后面的用例会继续看到替身。
  */
 function delegateSpawnToFake() {
-  const delegate = (bin, args, options) => spawn(FAKE.bin, args || [], options);  __setSpawnForTest(delegate);
+  const delegate = (bin, args, options) => spawn(FAKE.bin, args || [], options);
+  __setSpawnForTest(delegate);
   __resetFfmpegProbe();
   return () => {
     __setSpawnForTest(null);
