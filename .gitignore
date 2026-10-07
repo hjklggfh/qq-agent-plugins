@@ -1,0 +1,18 @@
+# 这个文件刻意**不**忽略 node_modules。
+#
+# 原因：本仓库的插件放在安装目录**之外**，而 Node 只往上层目录找依赖 ——
+# `/mnt/data/qq-agent/plugins/<id>/` 的上层是 `/mnt/data/qq-agent/plugins`、`/mnt/data/qq-agent`、
+# `/mnt/data`、`/`，**够不到** `/mnt/data/qq-agent/app/node_modules`。
+# 也就是说：外部根的插件 import 任何 npm 包都会 ERR_MODULE_NOT_FOUND（实测过）。
+#
+# 所以某个插件真需要依赖时，就在那个插件目录里 `npm i --omit=dev` 并把 node_modules 一起提交 ——
+# 或者反过来，在服务器上 cd 进插件目录跑一次 npm i（那就需要把下面这行打开）。
+# 优先考虑零依赖：Node 内置模块 + 能力门面通常就够了（fetch 是全局的，不用装 undici）。
+# node_modules/
+
+# 系统 / 编辑器垃圾
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
+*.tmp
