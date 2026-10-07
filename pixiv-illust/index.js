@@ -138,6 +138,15 @@ const DEFAULTS = {
   proxyUrl: '',
   poolSize: 5,
   maxCount: 2,
+  // 一个作品最多发几页（多图作品）。1 = 只发第一张（旧行为）。
+  //
+  // 为什么不需要"总页数"：页码从 0 连续排，而接口（api.lolicon.app）只给 `p`（这一页的页号）、
+  // 不给张数 —— 所以从第 2 页起**逐页试**，遇到"这一页取不到"就停。单图作品只多花一次请求，
+  // 而且那个请求本来就是它要取的那一页。
+  //
+  // 默认 4（而不是 1）：用户要的就是"多图作品的图"。上限存在的意义是别让一个 20 页的作品
+  // 把群聊刷屏、也别把 60 秒的工具预算耗光（每页 1~3 秒）。
+  maxPages: 4,
   // 分级：多选（全年龄 / R18 / R18G），可选一个或多个、**至少一个**。
   // 只有勾上的档会发出来。旧字段 allowR18 仍保留在下面，只在配置里没有 ratings 时才读。
   ratings: ['safe'],
@@ -786,7 +795,7 @@ export function buildImageUrl(template, pid) {
  *     （实测 https://pixiv.re/{pid}.png 对某些 pid 返回 404，而对另一些正常返回图片；
  *      注意它会 301 到原图，所以拿到的还是大图，只有前面几条都不行时才轮到它）。
  */
-export function imageCandidates(item, template) {
+export function imageCandidates(item, template, { allowTemplate = true } = {}) {
   const list = [];
   const push = (raw) => {
     const u = String(raw ?? '').trim();
@@ -794,7 +803,9 @@ export function imageCandidates(item, template) {
   };
   for (const one of (Array.isArray(item?.imageUrls) ? item.imageUrls : [])) push(one);
   push(item?.imageUrl);
-  push(buildImageUrl(template, item?.pid));
+  // 多图作品取第 2 页起时必须关掉模板：模板 `pixiv.re/{pid}.png` 只会给**第 0 页**，
+  // 留着它会把"第 3 页取不到"悄悄变成"又发了一遍第 1 页"（见 maxPages 那一段）。
+  if (allowTemplate) push(buildImageUrl(template, item?.pid));
   return list;
 }
 
@@ -806,7 +817,11 @@ export function imageCandidates(item, template) {
  *         pid:'127664527', page:'0', ext:'jpg' }
  */
 export function parseOriginalPath(url) {
-  const m = /\/(\d{4})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d+)_p(\d+)\.([a-z0-9]+)/i
+  // 页码后面允许多一个 `_后缀`：接口给的尺寸档地址长这样 ——
+  //   …/<pid>_p1_master1200.jpg、…/<pid>_p1_square1200.jpg
+  // 而原图地址是 …/<pid>_p1.jpg。两种都必须认出来：前者是多图推导真正会拿到的形状，
+  // 只认后者会让"第 2 页起"静默失效（正则不匹配 → 返回空候选 → 多发不了一页，还不报错）。
+  const m = /\/(\d{4})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d+)_p(\d+)(?:_[a-z0-9]+)?\.([a-z0-9]+)/i
     .exec(String(url ?? ''));
   if (!m) return null;
   return {
@@ -838,6 +853,24 @@ export function sizeUrlsFromOriginal(originalUrl, size = DEFAULTS.imageSize) {
   };
   // mini 的形状没有实测依据，不给（sizeLadderFrom 里它就自然落空）
   return sizeLadderFrom(size).map((key) => ladder[key]).filter(Boolean);
+}
+
+/**
+ * 同一个作品**第 page 页**的候选地址（按尺寸档从大到小）。认不出日期路径就返回空数组。
+ *
+ * 多图作品的每一页地址只差 `_p<页码>`（`<pid>_p0.jpg` / `<pid>_p1.jpg` …），而日期路径
+ * 在**任意一页**的地址里都有 —— 所以拿到第 0 页的地址，就能拼出后面每一页。
+ * 接口（api.lolicon.app）给了 `p`（这一页的页号）但**不给总页数**，所以张数靠调用方逐页试。
+ */
+export function pageUrlsOf(item, page, size = DEFAULTS.imageSize) {
+  const base = String(item?.imageUrl || (Array.isArray(item?.imageUrls) ? item.imageUrls[0] : '') || '').trim();
+  const p = parseOriginalPath(base);
+  if (!p) return [];
+  let origin = '';
+  try { origin = new URL(base).origin; } catch { return []; }
+  const rebuilt = `${origin}/img-original/img/${p.year}/${p.month}/${p.day}/${p.hour}/${p.minute}/${p.second}`
+    + `/${p.pid}_p${clamp(Number(page) || 0, 0, 999)}.${p.ext}`;
+  return sizeUrlsFromOriginal(rebuilt, size);
 }
 
 /** 把 HTTP 状态翻成人话 —— 404 和超时是完全不同的两件事，别混成一句"反代挂了"。 */
@@ -1374,14 +1407,17 @@ function say(message) {
  * （见 isHardNetError 的说明：大图传不完就换更小的档，而不是放弃整张）。
  * 只有硬失败（DNS 不了 / 连接被拒）才放弃整张 —— 那时换域名也一样连不上，白等一个超时没意义。
  */
-async function fetchImage(item, s) {
+async function fetchImage(item, s, { allowTemplate = true } = {}) {
   // 「给 pid/链接」那条路只有模板一个候选（**完全没有图床给的地址**）→ 先用 301 推出尺寸版。
   // 这一步是它唯一能拿到小图的机会：模板本身给的是原图，往往超过 maxImageBytes。
   // ⚠️ 条件必须是"连 imageUrl 都没有"，不能只看 imageUrls 空不空：
   //    走 pixiv.net 后端那条路也是只有 imageUrl、没有 imageUrls，而它已经有真地址了，
   //    再探测一次纯属白费一个请求（有用例盯着这个次数）。
+  // ⚠️ allowTemplate=false：取多图作品的第 2 页起时必须关掉模板（模板只给第 0 页），
+  //    否则"第 3 页取不到"会变成"又发了一遍第 1 页"。
+  //    只在 allowTemplate 时才做 301 探测 —— 那个探测的目的就是"找一个非模板的地址"。
   let itemUrls = Array.isArray(item?.imageUrls) ? item.imageUrls : [];
-  if (!itemUrls.length && !String(item?.imageUrl ?? '').trim() && item?.pid) {
+  if (allowTemplate && !itemUrls.length && !String(item?.imageUrl ?? '').trim() && item?.pid) {
     const derived = await sizeUrlsFromTemplate(buildImageUrl(s.imageUrlTemplate, item.pid), s, item.pid);
     if (derived.length) {
       itemUrls = derived;
@@ -1390,7 +1426,7 @@ async function fetchImage(item, s) {
       } catch { /* 日志失败不影响取图 */ }
     }
   }
-  const urls = imageCandidates({ ...item, imageUrls: itemUrls }, s.imageUrlTemplate);
+  const urls = imageCandidates({ ...item, imageUrls: itemUrls }, s.imageUrlTemplate, { allowTemplate });
   let last = null;
   for (let i = 0; i < urls.length; i += 1) {
     try {
@@ -1402,7 +1438,9 @@ async function fetchImage(item, s) {
         api?.log?.info?.(`[pixiv-illust] 取图成功 ${item.pid}：${Math.round(got.bytes / 1024)}KB`
           + `（第 ${i + 1}/${urls.length} 个候选，档位 ${s.imageSize}）`);
       } catch { /* 日志失败不影响取图 */ }
-      return got;
+      // 把**实际用到的地址**一并带出去：多图续页要靠它认出日期路径，而"给 pid/链接"那条路
+      // 的日期路径只存在于这里（它没有接口给的 imageUrl）——不带出去，那条路就永远只有第 1 页。
+      return { ...got, url: urls[i] };
     } catch (error) {
       last = error;
       if (error?.hardNetError) break;
@@ -1576,6 +1614,37 @@ export async function activate(hostApi) {
             // 只有真的发出去了才记账 —— 失败不记，否则一次网络抖动就把这张图永久跳过
             markSeen(it.pid);
             done.push({ pid: it.pid, title: it.title, author: it.author, bookmarks: Number.isFinite(it.bookmarks) ? it.bookmarks : null });
+
+            // ③.5 多图作品：接着发第 2..maxPages 页。
+            //
+            // 为什么逐页试而不是"按总页数循环"：接口只给 `p`（这一页的页号），**不给张数**。
+            // 好在页码从 0 连续排，所以从第 1 页起一页页试、遇到"这一页不存在"就停即可 ——
+            // 单图作品只多花一次请求，而那次请求本来就是它要取的那一页。
+            //
+            // 三条硬约束：
+            //   · 第 2 页起必须关掉 PID 模板（模板只给第 0 页，否则会重复发第一张）；
+            //   · 后页失败**不回滚**已经发出去的第一页，也不计入 failed（那不是"图都没发出去"）；
+            //   · 认不出日期路径就直接放弃续页（拼不出别的页码）。
+            const maxPages = Math.max(1, Math.round(Number(s.maxPages) || 1));
+            // 「给 pid/链接」那条路的日期路径只存在于"实际取到的那条地址"里（见 fetchImage 的
+            // 返回）—— 补回条目上，续页才认得出来。接口给过地址的那条路本来就不缺它。
+            if (!String(it.imageUrl ?? '').trim() && got.url) it.imageUrl = got.url;
+            for (let page = 1; page < maxPages; page += 1) {
+              const pageUrls = pageUrlsOf(it, page, s.imageSize);
+              if (!pageUrls.length) break;
+              try {
+                const more = await fetchImage({ ...it, imageUrl: '', imageUrls: pageUrls }, s, { allowTemplate: false });
+                await toolCtx.sendImage({ path: more.file }, { label: `${note}（第 ${page + 1} 页）` });
+              } catch (error) {
+                const status = Number(error?.status) || 0;
+                // 404/410 = 这个作品没有这一页 → 正常结束（不记日志，那是预期的边界）
+                if (status !== 404 && status !== 410) {
+                  say(`[pixiv-illust] ${it.pid} 第 ${page + 1} 页取不到`
+                    + `（${String(error?.message ?? error).slice(0, 60)}），这个作品就发到这里`);
+                }
+                break;
+              }
+            }
           } catch (error) {
             const status = Number(error?.status) || 0;
             // 404 是"作品本身没了"，不是线路问题 —— 拉黑它，否则同一个关键词每次都会再挑到这张死图

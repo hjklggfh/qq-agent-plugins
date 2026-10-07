@@ -57,7 +57,7 @@ const {
   buildLoliconUrl, mapLoliconItems, resolveRatings, filterByRating, normalizeRatingTokens,
   pickUnseen, buildTryList, extractPid, ownerIdSet, latestCaller, callerMayChangeRating,
   ratingsForChat, ratingOf, describeFetchError, resolveProxyUrl, deadSet, breakerState,
-  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal
+  imageCandidates, sizeLadderFrom, parseOriginalPath, sizeUrlsFromOriginal, pageUrlsOf
 } = plugin;
 
 const { buildPluginApi, buildPluginToolContext } = hostReady ? await import(hostUrl('plugins/_host/context.js')) : {};
@@ -912,6 +912,107 @@ check('装载器全流程：带审批 initPlugins → loaded，注入的工具�
   // 同一个自建根里的另一个插件（my-first-plugin）也在，未启用就是 disabled
   assert.equal(result.statuses.find((item) => item.id === 'my-first-plugin').status, 'disabled');
   await resetPlugins();
+});
+
+// ── 多图作品（2026-10-08 第三轮）─────────────────────────────────────────────
+//
+// 需求：通过 pid 发图时只发第一张，而很多作品是多图的。
+// 办法：多图作品每一页的地址只差 `_p<页码>`，而**日期路径在任意一页的地址里都有** ——
+// 所以拿到第 0 页的地址就能拼出后面每一页。接口（api.lolicon.app）给了 `p`（这一页的页号）
+// 但**不给总页数**，所以张数靠逐页试：页码从 0 连续排，遇到"这一页取不到"就停。
+
+check('parseOriginalPath：原图 / master1200 / square1200 三种形状都要认出来', () => {
+  const want = {
+    year: '2021', month: '11', day: '13', hour: '12', minute: '46', second: '15',
+    pid: '94101307', page: '1', ext: 'jpg'
+  };
+  // 原图形状
+  assert.deepEqual(parseOriginalPath('https://i.pixiv.re/img-original/img/2021/11/13/12/46/15/94101307_p1.jpg'), want);
+  // ⚠️ 接口给的是这两种 —— 第一版的正则要求页码后紧跟一个点，于是**只认原图形状**，
+  //    多图续页会静默失效（返回空候选、多发不了一页、还不报错）。这条用例专门盯它。
+  assert.deepEqual(parseOriginalPath('https://i.pixiv.re/img-master/img/2021/11/13/12/46/15/94101307_p1_master1200.jpg'), want);
+  assert.deepEqual(parseOriginalPath('https://i.pixiv.re/c/250x250_80_a2/img-master/img/2021/11/13/12/46/15/94101307_p1_square1200.jpg'), want);
+  assert.equal(parseOriginalPath('https://pixiv.re/94101307.png'), null);
+});
+
+check('pageUrlsOf：从任意一页推出别的页（含 master1200 形状与尺寸档）', () => {
+  // 这是接口真实返回过的形状（pid 94101307 = 用户实测那条）
+  const item = { pid: '94101307', imageUrl: 'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15/94101307_p0_master1200.jpg' };
+  assert.equal(pageUrlsOf(item, 1, 'regular')[0],
+    'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15/94101307_p1_master1200.jpg');
+  assert.equal(pageUrlsOf(item, 2, 'regular')[0],
+    'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15/94101307_p2_master1200.jpg');
+  // 尺寸档照旧生效（大图传不完就换小的）
+  assert.deepEqual(pageUrlsOf(item, 1, 'small'), [
+    'https://i.pixiv.re/c/540x540_70/img-master/img/2021/11/13/12/46/15/94101307_p1_master1200.jpg',
+    'https://i.pixiv.re/c/250x250_80_a2/img-master/img/2021/11/13/12/46/15/94101307_p1_square1200.jpg'
+  ]);
+  // 认不出日期路径（比如只有 PID 模板）→ 空数组，调用方据此放弃续页
+  assert.deepEqual(pageUrlsOf({ pid: '1', imageUrl: 'https://pixiv.re/1.png' }, 1), []);
+  assert.deepEqual(pageUrlsOf({}, 1), []);
+});
+
+check('imageCandidates：取第 2 页起必须关掉 PID 模板（否则会重复发第 1 页）', () => {
+  const page2 = ['https://i.pixiv.re/img-master/img/2021/11/13/12/46/15/94101307_p1_master1200.jpg'];
+  const item = { pid: '94101307', imageUrl: '', imageUrls: page2 };
+  // 开模板：多出 `pixiv.re/{pid}.png` —— 那个**只给第 0 页** ✗
+  assert.deepEqual(imageCandidates(item, 'https://pixiv.re/{pid}.png'),
+    [...page2, 'https://pixiv.re/94101307.png']);
+  // 关模板：只剩这一页
+  assert.deepEqual(imageCandidates(item, 'https://pixiv.re/{pid}.png', { allowTemplate: false }), page2);
+});
+
+check('多图作品：第 1 张之后自动续发后面几页，取不到就停，且绝不重复发第 1 页', async () => {
+  internals.__setState([], []);            // PID 索引清空（否则这张作品会被当成"已发过"）
+  const pid = '94101307';
+  const base = 'https://i.pixiv.re/img-master/img/2021/11/13/12/46/15';
+  const asked = [];
+  const { ctx, images } = fakeHostCtx();
+  const toolCtx = makeToolCtx(ctx);
+  // ⚠️ 状态目录必须用**门面**给的那个（toolCtx.dir）：门面的 sendImage({path}) 有路径守卫，
+  //    只接受 pluginStateDir(dataDir, id) 之内的文件。自己 mkdtemp 一个会**每一张都被拒**
+  //    （症状是"一张都没发出去"，跟本次要验的东西完全无关 —— 第一次就踩了）。
+  internals.__setStateDir(toolCtx.dir);
+
+  await withFetch(
+    async (url) => {
+      const u = String(url);
+      asked.push(u);
+      if (u.includes('/setu/v2')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (n) => (String(n).toLowerCase() === 'content-type' ? 'application/json' : null) },
+          async json() {
+            return {
+              data: [{
+                pid: Number(pid), p: 0, title: '多图作品', author: '作者', r18: false,
+                tags: ['测试'], ext: 'jpg', urls: { regular: `${base}/${pid}_p0_master1200.jpg` }
+              }]
+            };
+          }
+        };
+      }
+      if (u.includes(`/${pid}_p0_`)) return fakeImageResponse({ contentLength: 1000, body: chunkStream([new Uint8Array(1000)]) });
+      if (u.includes(`/${pid}_p1_`)) return fakeImageResponse({ contentLength: 2000, body: chunkStream([new Uint8Array(2000)]) });
+      if (u.includes(`/${pid}_p2_`)) return fakeImageResponse({ status: 404 });   // 第 3 页不存在
+      throw new Error(`不该请求这个地址：${u}`);
+    },
+    () => registered.get('pixiv_image').execute(toolCtx, { keyword: '测试' })
+  );
+
+  assert.equal(images.length, 2, `该发第 1、2 页（第 3 页 404 就停），实际发了 ${images.length}`);
+  assert.equal(images[0].payload.bytes, 1000, '第一张是第 1 页');
+  assert.equal(images[1].payload.bytes, 2000, '第二张是第 2 页');
+  assert.match(images[1].payload.label, /第 2 页/, '续页的文案要标出页号');
+  // 这条是防"多图变重复图"的关键：模板只给第 0 页，一旦回退到它就会把第 1 页再发一遍
+  assert.ok(!asked.some((one) => one.includes('pixiv.re/94101307.png')),
+    `绝不该请求 PID 模板，实际请求过：${asked.filter((one) => one.includes('pixiv.re')).join(', ')}`);
+  // 遇到"这一页不存在"必须**立刻停**：不然后面每一页都要白等一整个超时
+  // （maxPages=4 时会去试 _p3_）。第一次写这条用例时只验了"发了几张"，漏掉了这一半 ——
+  // 是变异测试（把 break 去掉）没被抓住才发现的。
+  assert.ok(!asked.some((one) => one.includes(`/${pid}_p3_`)),
+    `第 3 页已经 404，不该再去试第 4 页。实际请求过：${asked.filter((one) => one.includes('_p')).join(', ')}`);
 });
 
 // ── 5MB→1.3MiB 那个上限、以及"给 pid 时推出尺寸版"（2026-10-08 第二轮）────────
