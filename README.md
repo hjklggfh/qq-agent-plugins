@@ -179,3 +179,16 @@ QQ_AGENT_HOME=/mnt/data/qq-agent/app node --test /mnt/data/qq-agent/plugins/my-f
 | 用现有六个能力写、增删改插件 | **不用**（就是这个仓库的意义） |
 | 插件需要一个**新能力**（消息钩子、定时器、提示词注入、发语音、群管理…） | **要** —— 那要改主程序的 `plugins/_host/capabilities.js` 与 `context.js` |
 | 改主程序代码本身 | **要** |
+
+### Agent 网页管理 Pixiv 会话分级
+
+打开“插件 → pixiv-illust → 设置”后，页面会单独显示“按会话分级”编辑框。每个键写成 `group:<群号>` 或 `private:<QQ号>`，值是 `safe`、`r18`、`r18g` 数组。例如：
+
+```json
+{
+  "group:1128139524": ["safe", "r18", "r18g"],
+  "group:866925557": ["safe"]
+}
+```
+
+保存后会写入服务器的 `data/plugin-state/pixiv-illust/chat-ratings.json`，不会把这些键混入全局插件设置。修改完成后重启服务，插件进程才会重新加载分级；未列出的会话使用全局 `ratings`。
