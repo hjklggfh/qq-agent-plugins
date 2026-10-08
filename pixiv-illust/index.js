@@ -1320,6 +1320,26 @@ async function requestJson(url) {
  * 否则这条路径会绕过会话分级。拿不到可信分级时由调用方拒绝发送。
  */
 async function fetchIllustMetadata(s, pid) {
+  // 先走内置公开接口：它返回 r18/tags/urls，不依赖 www.pixiv.net。
+  // Lolicon 当前不会按 pid 参数查询，改用 keyword 后必须精确匹配 PID，
+  // 防止把“搜到的另一张图”误当成用户指定的作品。
+  try {
+    const raw = await requestJson(buildLoliconUrl(s.loliconApiUrl, pid, {
+      limit: 20,
+      allowed: new Set([0, 1, 2]),
+      excludeAI: false,
+      mode: 'keyword',
+      size: s.imageSize
+    }));
+    const exact = mapLoliconItems(raw, { size: s.imageSize })
+      .find((item) => item.pid === String(pid));
+    if (exact && ratingKnown(exact)) return exact;
+  } catch (error) {
+    try { api?.log?.warn?.(`[pixiv-illust] PID ${pid} 的内置元数据查询失败：${error?.message ?? error}`); } catch { /* 日志失败不影响后续判断 */ }
+  }
+
+  // 没有代理时 www.pixiv.net 在目标服务器上不可达，避免白等一个超时。
+  if (!resolveProxyUrl(s)) return null;
   const base = String(s.searchUrlTemplate || DEFAULTS.searchUrlTemplate);
   let origin = 'https://www.pixiv.net';
   try { origin = new URL(base).origin; } catch { /* 使用默认 Pixiv 域名 */ }
@@ -1992,7 +2012,7 @@ export async function activate(hostApi) {
           // 绝不能因为用户点名了 PID 就把未知作品当成全年龄发送。
           const meta = await fetchIllustMetadata(s, pidArg);
           if (!meta || !ratingKnown(meta)) {
-            return err(`无法确认 Pixiv 作品 ${pidArg} 的分级，已拒绝发送（请配置可访问 pixiv.net 的代理或改用可返回分级的搜索接口）。`);
+            return err(`无法确认 Pixiv 作品 ${pidArg} 的分级，已拒绝发送。当前内置接口不能按 PID 查询；请改用关键词，或配置可访问 pixiv.net 的 HTTP 代理后重试。`);
           }
           const itemRating = ratingOf(meta);
           if (!allowed.has(itemRating)) {
