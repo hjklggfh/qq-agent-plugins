@@ -2194,7 +2194,9 @@ export async function activate(hostApi) {
       } catch (error) {
         // ⚠️ 没挂代理时，失败**就发生在这里**（搜索阶段网络错误），而不是上面
         // "搜到空结果"那个分支 —— 所以改走贴链接的建议必须挂在这儿才有用。
-        const alt = (!searchOk && error?.netError)
+        // PID/链接直取路径本来就不会调用搜索接口；不能因为 searchOk 保持 false
+        // 就把后续的图片下载失败误报成“搜索接口连不上”。
+        const alt = (!pidArg && !searchOk && error?.netError)
           ? '（搜索接口连不上：让对方贴作品链接，或直接给作品号 —— 取图那条路不用搜索接口）'
           : '';
         return err(`Pixiv 取图失败：${error?.message ?? error}${alt}`);
