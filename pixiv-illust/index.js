@@ -2012,13 +2012,20 @@ export async function activate(hostApi) {
           // 绝不能因为用户点名了 PID 就把未知作品当成全年龄发送。
           const meta = await fetchIllustMetadata(s, pidArg);
           if (!meta || !ratingKnown(meta)) {
-            return err(`无法确认 Pixiv 作品 ${pidArg} 的分级，已拒绝发送。当前内置接口不能按 PID 查询；请改用关键词，或配置可访问 pixiv.net 的 HTTP 代理后重试。`);
+            // 内置接口无法按 PID 查询、且服务器没有 Pixiv 代理时，保留旧的 PID 直取能力。
+            // 未知分级只能按“最高风险”处理：必须同时明确允许 R18 与 R18G，
+            // 才能发送；默认 safe 或只允许 R18 的会话仍然拒绝，避免把未知内容发进普通群。
+            if (!(allowed.has(1) && allowed.has(2))) {
+              return err(`无法确认 Pixiv 作品 ${pidArg} 的分级，已拒绝发送。请改用关键词、配置 HTTP 代理，或在明确允许 R18 与 R18G 的会话中重试。`);
+            }
+            picked = [{ pid: pidArg, title: '', author: '', bookmarks: NaN, tags: [], xRestrict: 0 }];
+          } else {
+            const itemRating = ratingOf(meta);
+            if (!allowed.has(itemRating)) {
+              return err(`作品 ${pidArg} 被分级设置拦截（${ratingLabel(itemRating)}；当前只允许 ${[...allowed].map(ratingLabel).join('、')}）。`);
+            }
+            picked = [meta];
           }
-          const itemRating = ratingOf(meta);
-          if (!allowed.has(itemRating)) {
-            return err(`作品 ${pidArg} 被分级设置拦截（${ratingLabel(itemRating)}；当前只允许 ${[...allowed].map(ratingLabel).join('、')}）。`);
-          }
-          picked = [meta];
         } else {
           // ①-B 搜（后端按 searchBackend：auto 会先走内置接口，不需要代理）
           const found = await searchIllusts(s, keyword, want, allowed);
