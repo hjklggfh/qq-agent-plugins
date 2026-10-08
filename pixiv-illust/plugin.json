@@ -1,13 +1,13 @@
 {
   "id": "pixiv-illust",
   "name": "Pixiv 来张图（自建）",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "apiVersion": 1,
   "entry": "index.js",
   "description": "按角色／关键词搜 Pixiv 插画并发到当前会话，带 PID 索引：发过的作品不会再发第二次，发图存档里附带【PID·标题·作者】。搜索走内置的公开检索接口（api.lolicon.app/setu/v2，按 Pixiv 标签检索），实测大陆可直连，所以「来张初音ミク的图」不用挂梯子；也可以直接给 pid 或 pixiv 作品链接，那两种会跳过搜索。取图按尺寸档（默认 regular，可用 imageSize 改成 original/small/thumb/mini），失败会自动退到更小的档 —— 默认不用 original 是因为某些作品的原图有 12MB，而在部分网络上这么大的文件传不完（实测传到一半被重置）。接口索引偏旧，里面可能留着已被作者删除／限制访问的作品，那种会试完所有地址后自动换下一张备选，并被拉黑一段时间。代价：内置接口不返回收藏数，存档里的 ★ 会缺席（想要收藏数就把搜索后端切成 pixiv.net，那条路需要代理）。图片由插件自己带 Referer 下好、落成状态目录里的临时文件再发送。",
   "capabilities": ["chat:read", "chat:send-forward", "chat:send-image", "storage", "http"],
   "tools": [
-    { "name": "pixiv_image", "timeoutMs": 60000 },
+    { "name": "pixiv_image", "timeoutMs": 120000 },
     { "name": "pixiv_set_rating", "timeoutMs": 15000 }
   ]
 }

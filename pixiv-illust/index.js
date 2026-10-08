@@ -147,16 +147,18 @@ const DEFAULTS = {
   //
   // 默认 4（而不是 1）：用户要的就是"多图作品的图"。上限存在的意义是别让一个 20 页的作品
   // 把群聊刷屏、也别把 60 秒的工具预算耗光（每页 1~3 秒）。
-  maxPages: 4,
+  // 一次最多抓一个多图作品的 20 页。宿主合并转发也允许 20 张图片；
+  // 实际仍会受 pageBudgetMs 与 forwardBudgetBytes 双重限制。
+  maxPages: 20,
   // 续页的**时间预算**（毫秒）。工具的硬上限是 60 秒，而下载与最后那次发送共用它 ——
   // 取图阶段先花掉 30 秒就收手，把剩下的一半留给发送。按"页数"限制是不够的：每页 1~5MB，
   // maxPages=10 照样能顶穿 60 秒，然后工具被掐断、**什么都没发出去**（2026-10-08 实测）。
-  pageBudgetMs: 30000,
+  pageBudgetMs: 100000,
   // 续页的**字节预算**。它盯的**不是**门面那个 12MB 上限，而是"一张卡片多大才发得动" ——
   // 2026-10-08 线上实测：一张 10MB 的卡片（base64 后约 14MB）光是**发出去**就把 60 秒耗光了
   // （走 WebSocket 通道不假，但腾讯那边收下 10MB 也要时间）。**瓶颈在发送、不在下载**，
   // 所以这个值要按"发得动的卡片"来定，经验值约 4MB。
-  forwardBudgetBytes: 4 * 1024 * 1024,
+  forwardBudgetBytes: 8 * 1024 * 1024,
   // ── 降采样（2026-10-08 第四轮：让 4MB 的卡片装得下 10+ 页）──────────────────
   //
   // 为什么需要：上面那条 `forwardBudgetBytes`（4MB）是按"卡片发得动"定的，而**多图作品的
@@ -358,11 +360,19 @@ export function deadSet(now = Date.now(), ttlDays = null) {
 export function normalizeItem(raw) {
   const pid = String(raw?.id ?? raw?.illust_id ?? raw?.illustId ?? '').trim();
   if (!/^\d+$/.test(pid)) return null;
-  const tags = Array.isArray(raw?.tags)
-    ? raw.tags.map((t) => String(typeof t === 'string' ? t : (t?.tag ?? ''))).filter(Boolean)
-    : [];
+  const rawTags = Array.isArray(raw?.tags)
+    ? raw.tags
+    : (Array.isArray(raw?.tags?.tags) ? raw.tags.tags : []);
+  const tags = rawTags
+    .map((t) => String(typeof t === 'string' ? t : (t?.tag ?? t?.name ?? t?.translated_name ?? '')).trim())
+    .filter(Boolean);
   const bookmarks = Number(raw?.bookmarkCount ?? raw?.total_bookmarks ?? raw?.bookmark_count);
-  return {
+  const hasXRestrict = raw?.xRestrict !== undefined || raw?.x_restrict !== undefined || raw?.sl !== undefined;
+  const rawR18 = raw?.r18 ?? raw?.isR18;
+  const hasR18 = typeof rawR18 === 'boolean'
+    || (typeof rawR18 === 'number' && Number.isFinite(rawR18))
+    || (typeof rawR18 === 'string' && /^(true|false|0|1)$/i.test(rawR18.trim()));
+  const item = {
     pid,
     title: String(raw?.title ?? '').trim() || '（无题）',
     author: String(raw?.userName ?? raw?.user_name ?? raw?.user?.name ?? '').trim() || '（未知作者）',
@@ -372,6 +382,11 @@ export function normalizeItem(raw) {
     tags,
     thumbnail: String(raw?.url ?? raw?.thumbnail ?? '').trim()
   };
+  Object.defineProperties(item, {
+    r18: { value: hasR18 && !/^(false|0)$/i.test(String(rawR18).trim()), enumerable: false },
+    ratingKnown: { value: hasXRestrict || hasR18, enumerable: false }
+  });
+  return item;
 }
 
 /**
@@ -460,14 +475,21 @@ export function mapLoliconItems(raw, { size = DEFAULTS.imageSize } = {}) {
     const pid = String(it?.pid ?? '').trim();
     if (!/^\d+$/.test(pid)) return null;
     const picked = pickSizeUrls(it?.urls, size);
-    return {
+    const r18Value = it?.r18;
+    const hasR18 = typeof r18Value === 'boolean'
+      || (typeof r18Value === 'number' && Number.isFinite(r18Value))
+      || (typeof r18Value === 'string' && /^(true|false|0|1)$/i.test(r18Value.trim()));
+    const r18 = hasR18 && !/^(false|0)$/i.test(String(r18Value).trim());
+    const item = {
       pid,
       title: String(it?.title ?? '').trim() || '（无题）',
       author: String(it?.author ?? '').trim() || '（未知作者）',
       userId: String(it?.uid ?? '').trim(),
       bookmarks: NaN,                        // 这个接口不给收藏数
-      xRestrict: it?.r18 === true ? 1 : 0,   // 统一交给 isR18 判定，避免两套 R18 口径
-      tags: Array.isArray(it?.tags) ? it.tags.map((t) => String(t)) : [],
+      xRestrict: r18 ? 1 : 0,   // 统一交给 ratingOf 判定，避免两套 R18 口径
+      tags: Array.isArray(it?.tags)
+        ? it.tags.map((t) => String(typeof t === 'string' ? t : (t?.tag ?? t?.name ?? t?.translated_name ?? ''))).filter(Boolean)
+        : [],
       thumbnail: picked[0] || '',
       // 图床给的地址，**按尺寸从大到小**排好了。取图时会依次试：
       // 大图传不完（这台机器的实测情况）就自动换更小的档，最后才落到 PID 模板。
@@ -475,6 +497,11 @@ export function mapLoliconItems(raw, { size = DEFAULTS.imageSize } = {}) {
       imageUrl: picked[0] || '',
       imageUrls: picked
     };
+    Object.defineProperties(item, {
+      r18: { value: hasR18 ? r18 : undefined, enumerable: false },
+      ratingKnown: { value: hasR18, enumerable: false }
+    });
+    return item;
   }).filter(Boolean);
 }
 
@@ -491,12 +518,30 @@ export function ratingOf(item) {
   if (!item) return 0;
   const x = Number(item.xRestrict);
   let r = (Number.isFinite(x) && x > 0) ? (x >= 2 ? 2 : 1) : 0;
+  const rawR18 = item.r18 ?? item.isR18;
+  const flaggedR18 = rawR18 === true || rawR18 === 1 || /^(true|1)$/i.test(String(rawR18 ?? '').trim());
+  if (flaggedR18) r = Math.max(r, 1);
   for (const t of (item.tags || [])) {
-    const s = String(t).trim();
+    const s = String(typeof t === 'string' ? t : (t?.tag ?? t?.name ?? t?.translated_name ?? ''))
+      .trim().toLowerCase().replace(/[\s_‐‑‒–—−]/g, '');
     if (/^(r-?18g|guro|リョナ|グロ|猎奇|猟奇)/i.test(s)) { r = Math.max(r, 2); continue; }
     if (/^(r-?18|成人向?|エロ)/i.test(s)) r = Math.max(r, 1);
   }
   return r;
+}
+
+/** 分级元数据是否足够可靠。未知时必须拒绝发送，不能把缺失字段当全年龄。 */
+export function ratingKnown(item) {
+  if (!item) return false;
+  if (item.ratingKnown === true) return true;
+  if (item.ratingKnown === false) {
+    return (item.tags || []).some((t) => /r\s*-?\s*18|guro|リョナ|猎奇|獵奇|成人向|エロ/i.test(String(t?.tag ?? t?.name ?? t?.translated_name ?? t)));
+  }
+  if (item.xRestrict !== undefined || item.x_restrict !== undefined || item.sl !== undefined) return true;
+  const rawR18 = item.r18 ?? item.isR18;
+  if (typeof rawR18 === 'boolean' || (typeof rawR18 === 'number' && Number.isFinite(rawR18))
+    || (typeof rawR18 === 'string' && /^(true|false|0|1)$/i.test(rawR18.trim()))) return true;
+  return (item.tags || []).some((t) => /r\s*-?\s*18|guro|リョナ|猎奇|獵奇|成人向|エロ/i.test(String(t?.tag ?? t?.name ?? t?.translated_name ?? t)));
 }
 
 /** R18 判定（是否成人向）—— 保留原契约：就是"分级大于 0"。 */
@@ -571,7 +616,8 @@ export function filterByRating(items, allowed) {
   const kept = [];
   const dropped = [];
   for (const it of items || []) {
-    (allowed.has(ratingOf(it)) ? kept : dropped).push(it);
+    // 分级字段缺失时不能默认当全年龄，否则第三方接口漏字段会变成安全绕过。
+    (ratingKnown(it) && allowed.has(ratingOf(it)) ? kept : dropped).push(it);
   }
   return { kept, dropped };
 }
@@ -1270,6 +1316,21 @@ async function requestJson(url) {
 }
 
 /**
+ * 直接给 PID/链接时补齐 Pixiv 的作品元数据。不能把“没有搜索结果”当成全年龄，
+ * 否则这条路径会绕过会话分级。拿不到可信分级时由调用方拒绝发送。
+ */
+async function fetchIllustMetadata(s, pid) {
+  const base = String(s.searchUrlTemplate || DEFAULTS.searchUrlTemplate);
+  let origin = 'https://www.pixiv.net';
+  try { origin = new URL(base).origin; } catch { /* 使用默认 Pixiv 域名 */ }
+  const raw = await requestJson(`${origin}/ajax/illust/${encodeURIComponent(pid)}`);
+  const body = raw?.body?.illust ?? raw?.body ?? raw?.illust ?? raw;
+  const item = normalizeItem({ ...body, id: body?.id ?? body?.illust_id ?? pid });
+  if (!item || item.pid !== String(pid)) return null;
+  return item;
+}
+
+/**
  * 按关键词取候选作品。
  *
  * backend：
@@ -1927,10 +1988,17 @@ export async function activate(hostApi) {
       try {
         let picked = [];
         if (pidArg) {
-          // ①-A 指定了作品号：跳过搜索，直接就是它
-          // 注意：这条路**不做分级过滤** —— 是群友点名要的那一张，按"指定就发"处理
-          // （要按分级挡住它就得出错，那不是这里该做的决定）。
-          picked = [{ pid: pidArg, title: '', author: '', bookmarks: NaN, tags: [], xRestrict: 0 }];
+          // ①-A 指定了作品号：仍然必须读取作品元数据并经过同一套分级规则。
+          // 绝不能因为用户点名了 PID 就把未知作品当成全年龄发送。
+          const meta = await fetchIllustMetadata(s, pidArg);
+          if (!meta || !ratingKnown(meta)) {
+            return err(`无法确认 Pixiv 作品 ${pidArg} 的分级，已拒绝发送（请配置可访问 pixiv.net 的代理或改用可返回分级的搜索接口）。`);
+          }
+          const itemRating = ratingOf(meta);
+          if (!allowed.has(itemRating)) {
+            return err(`作品 ${pidArg} 被分级设置拦截（${ratingLabel(itemRating)}；当前只允许 ${[...allowed].map(ratingLabel).join('、')}）。`);
+          }
+          picked = [meta];
         } else {
           // ①-B 搜（后端按 searchBackend：auto 会先走内置接口，不需要代理）
           const found = await searchIllusts(s, keyword, want, allowed);
@@ -2257,7 +2325,7 @@ export const internals = {
   safeSlice, stripLoneSurrogates,
   buildLoliconUrl, mapLoliconItems, searchIllusts,
   // 分级（含按会话覆盖）
-  ratingOf, ratingLabel, resolveRatings, allowedRatings, filterByRating, normalizeRatingTokens,
+  ratingOf, ratingKnown, ratingLabel, resolveRatings, allowedRatings, filterByRating, normalizeRatingTokens,
   ratingsForChat, chatRatingOf, setChatRating, clearChatRating, loadChatRatings,
   __resetChatRatingsCache, adminIdSet, latestCaller, callerMayChangeRating,
   buildTryList, imageCandidates, describeImageHttp, deadSet, pixivDirectCoolingDown,

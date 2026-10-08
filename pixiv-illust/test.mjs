@@ -1094,6 +1094,13 @@ check('给 pid 那条路：用 `-2`/`-3` 续页并打包成一条卡片，且**�
       if (options?.redirect === 'manual') {
         return { ok: true, status: 200, headers: { get: () => null }, body: null };
       }
+      if (u.endsWith(`/ajax/illust/${pid}`)) {
+        return {
+          ok: true, status: 200,
+          headers: { get: (name) => String(name).toLowerCase() === 'content-type' ? 'application/json' : null },
+          async json() { return { body: { id: pid, title: '指定作品', userName: '作者', xRestrict: 0, tags: ['测试'] } }; }
+        };
+      }
       if (u === `https://pixiv.re/${pid}.png`) {
         return fakeImageResponse({ contentLength: 1000, body: chunkStream([new Uint8Array(1000)]) });
       }
@@ -2145,4 +2152,3 @@ check('降采样（真压缩）：走逐张发那条路时，发的也是**缩�
     if (restoreSpawn) restoreSpawn();
   }
 }, NEED_FFMPEG);
-
